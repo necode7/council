@@ -191,38 +191,54 @@ holder = st.session_state.get("holder")
 running = bool(holder and not holder["done"])
 have_result = bool(holder and holder["done"] and holder["result"])
 
-# Hide the form while a run is in flight or after a result is shown
+# Hide the form while a run is in flight or after a result is shown.
+#
+# We're NOT using st.form here on purpose — forms batch their values until
+# submit, which means the "Models in this mode" expander wouldn't update
+# when the user changes the Mode dropdown. Outside of a form, every widget
+# change reruns the script and keeps the expander in sync.
 if not running:
-    with st.form("council_form", clear_on_submit=False):
-        mode = st.selectbox(
-            "Mode",
-            options=["scout", "verdict", "deep"],
-            index=1,
-            help="scout ≈ ₹2-3 · verdict ≈ ₹7-8 · deep ≈ ₹15-17",
-        )
-        question = st.text_area(
-            "Question",
-            height=280,
-            value=st.session_state.get("last_question", ""),
-            placeholder=(
-                "Council this: [your decision in one sentence]\n\n"
-                "Context:\n"
-                "- [stake 1]\n"
-                "- [stake 2]\n"
-                "- [hard constraint]\n"
-                "- [what's pulling you toward A]\n"
-                "- [what's pulling you toward B]\n\n"
-                "[The real question, sharpened.]"
-            ),
-            help="Richer context = sharper verdict. Don't pre-load the answer.",
-        )
-        generate_pdf = st.checkbox("Generate PDF", value=True)
-        submitted = st.form_submit_button(
-            "Run council", type="primary", use_container_width=True
-        )
+    # If a previous run set this flag, clear the question textarea state
+    # BEFORE the widget renders. Streamlit only honours session_state writes
+    # to a widget's key when the write happens before the widget is created.
+    if st.session_state.get("_clear_question"):
+        st.session_state["question_text"] = ""
+        del st.session_state["_clear_question"]
+    st.session_state.setdefault("question_text", "")
 
-    with st.expander("Models in this mode", expanded=False):
-        cfg = council.MODEL_SETS.get(mode, council.MODEL_SETS["verdict"])
+    mode = st.selectbox(
+        "Mode",
+        options=["scout", "verdict", "deep"],
+        index=1,
+        key="mode_select",
+        help="scout ≈ ₹2-3 · verdict ≈ ₹7-8 · deep ≈ ₹15-17",
+    )
+
+    question = st.text_area(
+        "Question",
+        height=280,
+        key="question_text",
+        placeholder=(
+            "Council this: [your decision in one sentence]\n\n"
+            "Context:\n"
+            "- [stake 1]\n"
+            "- [stake 2]\n"
+            "- [hard constraint]\n"
+            "- [what's pulling you toward A]\n"
+            "- [what's pulling you toward B]\n\n"
+            "[The real question, sharpened.]"
+        ),
+        help="Richer context = sharper verdict. Don't pre-load the answer.",
+    )
+
+    generate_pdf = st.checkbox("Generate PDF", value=True, key="gen_pdf")
+    submitted = st.button(
+        "Run council", type="primary", use_container_width=True, key="run_btn"
+    )
+
+    # Live-updates whenever `mode` changes, because we're outside a form.
+    with st.expander(f"Models in **{mode}** mode", expanded=False):
+        cfg = council.MODEL_SETS[mode]
         st.markdown(f"**Chairman:** `{cfg['chairman']}`")
         st.markdown("**Advisors:**")
         for name, model in zip(council.ADVISOR_NAMES, cfg["advisors"]):
@@ -245,8 +261,6 @@ if not running:
             )
             st.stop()
 
-        st.session_state["last_question"] = question
-        st.session_state["last_mode"] = mode
         st.session_state["last_generate_pdf"] = generate_pdf
 
         start_run(api_key, mode, question)
@@ -278,15 +292,17 @@ if running:
 # =============================================================================
 
 if holder and holder["done"] and holder.get("cancelled"):
-    st.warning("Run cancelled. Your question is still in the form above — edit and try again.")
+    st.warning("Run cancelled.")
     if st.button("Clear and start over", use_container_width=True):
         st.session_state.pop("holder", None)
+        st.session_state["_clear_question"] = True
         st.rerun()
 
 if holder and holder["done"] and holder.get("error"):
     st.error(f"Run failed: {holder['error']}")
     if st.button("Clear and try again", use_container_width=True):
         st.session_state.pop("holder", None)
+        st.session_state["_clear_question"] = True
         st.rerun()
 
 
@@ -312,7 +328,7 @@ if have_result:
     meta_cols = st.columns([3, 2])
     with meta_cols[0]:
         st.markdown(
-            f"**Topic:** {topic.replace('_', ' ')}  \n"
+            f"**Topic:** {council.topic_to_title(topic)}  \n"
             f"**Mode:** {mode.upper()}  \n"
             f"**Chairman:** `{chairman_model}`  \n"
             f"**Run took:** {elapsed:.1f}s"
@@ -333,6 +349,7 @@ if have_result:
 
         if st.button("🔄 New question", use_container_width=True):
             st.session_state.pop("holder", None)
+            st.session_state["_clear_question"] = True
             st.rerun()
 
     st.markdown("## 🏛️ Chairman's Verdict")
