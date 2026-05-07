@@ -119,6 +119,7 @@ async def call_openrouter(
     temperature: float,
     max_tokens: int,
     label: str,
+    max_retries: int = 2,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -135,24 +136,47 @@ async def call_openrouter(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    try:
-        resp = await client.post(
-            OPENROUTER_URL, headers=headers, json=payload, timeout=TIMEOUT
-        )
-        if resp.status_code != 200:
-            return f"[ERROR from {label} ({model}) — HTTP {resp.status_code}: {resp.text[:300]}]"
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            return f"[ERROR from {label} ({model}) — empty choices: {str(data)[:300]}]"
-        content = choices[0].get("message", {}).get("content", "")
-        if not content:
-            return f"[ERROR from {label} ({model}) — empty content]"
-        return content.strip()
-    except httpx.TimeoutException:
-        return f"[ERROR from {label} ({model}) — timed out after {TIMEOUT}s]"
-    except Exception as e:
-        return f"[ERROR from {label} ({model}) — {type(e).__name__}: {e}]"
+
+    last_error = f"[ERROR from {label} ({model}) — exhausted retries]"
+    for attempt in range(max_retries + 1):
+        try:
+            resp = await client.post(
+                OPENROUTER_URL, headers=headers, json=payload, timeout=TIMEOUT
+            )
+            if resp.status_code != 200:
+                last_error = f"[ERROR from {label} ({model}) — HTTP {resp.status_code}: {resp.text[:300]}]"
+                if resp.status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < max_retries:
+                    await asyncio.sleep(1.5 ** attempt)
+                    continue
+                return last_error
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                last_error = f"[ERROR from {label} ({model}) — empty choices: {str(data)[:300]}]"
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5)
+                    continue
+                return last_error
+            content = choices[0].get("message", {}).get("content", "")
+            if not content or not content.strip():
+                last_error = f"[ERROR from {label} ({model}) — empty content]"
+                if attempt < max_retries:
+                    # Bump max_tokens on retry — empty content often means
+                    # reasoning models burned all tokens internally.
+                    payload["max_tokens"] = int(max_tokens * 1.5)
+                    await asyncio.sleep(0.5)
+                    continue
+                return last_error
+            return content.strip()
+        except httpx.TimeoutException:
+            last_error = f"[ERROR from {label} ({model}) — timed out after {TIMEOUT}s]"
+            if attempt < max_retries:
+                continue
+            return last_error
+        except Exception as e:
+            last_error = f"[ERROR from {label} ({model}) — {type(e).__name__}: {e}]"
+            return last_error
+    return last_error
 
 
 # =============================================================================
@@ -165,25 +189,33 @@ async def topic_from_question(
     api_key: str,
     question: str,
 ) -> str:
-    """Cheap Haiku call → short snake_case label naming the decision."""
-    system = "You produce short snake_case topic labels. Output only the label, nothing else."
-    user = f"""Read the question and output a short snake_case label (2-4 words) that names the decision being asked about.
+    """Cheap Haiku call → short underscore-joined label naming the decision."""
+    system = "You produce short topic labels for a decision-making app. Output only the label, nothing else."
+    user = f"""Read the question and output a short topic label (2-4 words) that names the decision being asked about.
 
-Rules:
-- ASCII letters and digits only, joined by underscores
-- 2 to 4 words
+Format rules:
+- 2 to 4 words connected with underscores
+- ASCII letters and digits only
+- Title Case for normal words (Battery, Calculation, Strategy)
+- ALL CAPS for acronyms and short technical abbreviations (ML, AI, CA, US, API, RL, BMS, LLM)
+- lowercase for English connectors only: "of", "vs", "and", "the", "or"
 - No quotes, no explanation, just the label
-- Capture the core decision, not the surrounding context
 
 Examples:
 Q: "Council this: should I take the Microsoft offer or stay at my startup?"
-A: microsoft_offer_vs_startup
+A: Microsoft_Offer_vs_Startup
 
-Q: "Council this: do we ship the redesign Friday or push to next sprint?"
-A: ship_redesign_vs_delay
+Q: "Can ML help fix battery degradation calculation in real-time?"
+A: ML_Battery_Degradation_Calculation
 
-Q: "Council this: should I marry Priya or wait another year?"
-A: marry_priya_vs_wait
+Q: "Should I focus on CA finals or my RL project?"
+A: CA_Finals_vs_RL_Project
+
+Q: "Should I marry Priya or wait another year?"
+A: Marry_Priya_vs_Wait
+
+Q: "Should I quit my job and start a startup?"
+A: Quit_Job_for_Startup
 
 Question:
 {question[:2000]}
@@ -229,7 +261,7 @@ async def run_advisors(
         tasks.append(
             call_openrouter(
                 client, api_key, model, system, question,
-                temperature=0.7, max_tokens=600, label=name,
+                temperature=0.7, max_tokens=1200, label=name,
             )
         )
     results = await asyncio.gather(*tasks)
@@ -289,7 +321,7 @@ Be concise. Aim for 3 short paragraphs total — one per question.
         tasks.append(
             call_openrouter(
                 client, api_key, model, system, review_prompt,
-                temperature=0.7, max_tokens=400, label=f"{name} (review)",
+                temperature=0.7, max_tokens=1000, label=f"{name} (review)",
             )
         )
     results = await asyncio.gather(*tasks)
@@ -353,7 +385,7 @@ Now write the final synthesis. Use EXACTLY these section headers and order, in m
 
     return await call_openrouter(
         client, api_key, chairman_model, system, user,
-        temperature=0.5, max_tokens=1500, label="Chairman",
+        temperature=0.5, max_tokens=2500, label="Chairman",
     )
 
 
@@ -556,8 +588,32 @@ def md_to_html(md: str) -> str:
     return markdown2.markdown(md, extras=["fenced-code-blocks", "break-on-newline"])
 
 
+_LOWERCASE_CONNECTORS = {
+    "of", "the", "and", "a", "an", "or", "to", "vs", "in", "on",
+    "for", "by", "at",
+}
+
+
 def topic_to_title(topic: str) -> str:
-    return topic.replace("_", " ").replace("-", " ").strip()
+    """Underscore-joined slug → display title.
+
+    Haiku is asked to produce slugs with proper casing already (Title Case
+    for words, ALL CAPS for acronyms, lowercase connectors). We trust any
+    word that contains uppercase letters and only Title-case words that
+    came back fully lowercase. Connector words stay lowercase if not first.
+    """
+    raw = topic.replace("_", " ").replace("-", " ").strip()
+    if not raw:
+        return ""
+    out = []
+    for i, w in enumerate(raw.split()):
+        if any(c.isupper() for c in w):
+            out.append(w)
+        elif i > 0 and w in _LOWERCASE_CONNECTORS:
+            out.append(w)
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out)
 
 
 def _slug(s: str) -> str:
