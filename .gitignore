@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LLM Council artifacts and local Claude Code overrides
+*.pdf
+.claude/settings.local.json
+
