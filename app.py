@@ -9,14 +9,16 @@ Usage:
 """
 
 import asyncio
-import io
+import os
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import council
 
@@ -34,7 +36,7 @@ st.set_page_config(
 
 
 # =============================================================================
-# SIMPLE PASSWORD GATE
+# SECRETS / AUTH
 # =============================================================================
 
 def _secret(key: str, default: str = "") -> str:
@@ -50,7 +52,6 @@ def require_password() -> bool:
         return True
 
     expected = _secret("APP_PASSWORD")
-    # If no password is configured, allow (for local dev convenience).
     if not expected:
         st.session_state.auth_ok = True
         return True
@@ -72,48 +73,99 @@ if not require_password():
 
 
 # =============================================================================
-# RUN PIPELINE
+# COUNCIL PIPELINE (with progress + cancellation)
 # =============================================================================
 
-async def run_council(api_key: str, mode: str, question: str):
+class Cancelled(Exception):
+    pass
+
+
+async def _run_pipeline(api_key: str, mode: str, question: str, holder: dict):
     config = council.MODEL_SETS[mode]
     chairman_model = config["chairman"]
     advisor_models = dict(zip(council.ADVISOR_NAMES, config["advisors"]))
+    cancel_event: threading.Event = holder["cancel_event"]
+
+    def check_cancel():
+        if cancel_event.is_set():
+            raise Cancelled()
 
     async with httpx.AsyncClient() as client:
-        advisor_responses = await council.run_advisors(
-            client, api_key, advisor_models, question
-        )
+        holder["stage"] = "Reading your question…"
+        topic = await council.topic_from_question(client, api_key, question)
+        holder["topic"] = topic
+        check_cancel()
+
+        holder["stage"] = "5 advisors deliberating in parallel…"
+        advisors = await council.run_advisors(client, api_key, advisor_models, question)
+        check_cancel()
+
+        holder["stage"] = "Anonymous peer review…"
         reviews, letter_map = await council.run_peer_review(
-            client, api_key, advisor_models, advisor_responses, question
+            client, api_key, advisor_models, advisors, question
         )
-        chairman_verdict = await council.run_chairman(
-            client, api_key, chairman_model, question, advisor_responses, reviews
+        check_cancel()
+
+        holder["stage"] = "Chairman delivering verdict…"
+        verdict = await council.run_chairman(
+            client, api_key, chairman_model, question, advisors, reviews
         )
 
     return {
+        "topic": topic,
+        "mode": mode,
         "chairman_model": chairman_model,
         "advisor_models": advisor_models,
-        "advisor_responses": advisor_responses,
+        "advisor_responses": advisors,
         "reviews": reviews,
         "letter_map": letter_map,
-        "chairman_verdict": chairman_verdict,
+        "chairman_verdict": verdict,
+        "question": question,
     }
 
 
-def build_pdf_bytes(
-    mode: str,
-    chairman_model: str,
-    advisor_models: dict,
-    question: str,
-    advisor_responses: dict,
-    reviews: dict,
-    chairman_verdict: str,
-    timestamp: datetime,
-) -> bytes | None:
+def start_run(api_key: str, mode: str, question: str):
+    """Spawn a thread that runs the pipeline and updates session_state['holder']."""
+    holder = {
+        "stage": "Starting…",
+        "started_at": time.time(),
+        "done": False,
+        "cancelled": False,
+        "result": None,
+        "error": None,
+        "cancel_event": threading.Event(),
+        "topic": None,
+    }
+    st.session_state["holder"] = holder
+
+    def runner():
+        try:
+            result = asyncio.run(_run_pipeline(api_key, mode, question, holder))
+            holder["result"] = result
+        except Cancelled:
+            holder["cancelled"] = True
+        except Exception as e:
+            holder["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            holder["done"] = True
+            holder["finished_at"] = time.time()
+
+    t = threading.Thread(target=runner, daemon=True)
+    add_script_run_ctx(t)
+    t.start()
+
+
+def build_pdf_bytes(result: dict, timestamp: datetime) -> bytes | None:
     html = council.build_pdf_html(
-        mode, chairman_model, advisor_models, question,
-        advisor_responses, reviews, chairman_verdict, timestamp,
+        result["mode"],
+        result["chairman_model"],
+        result["advisor_models"],
+        result["question"],
+        result["advisor_responses"],
+        result["reviews"],
+        result["chairman_verdict"],
+        timestamp,
+        result["topic"],
     )
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -126,7 +178,7 @@ def build_pdf_bytes(
 
 
 # =============================================================================
-# UI
+# UI — INPUT FORM
 # =============================================================================
 
 st.title("🏛️ LLM Council")
@@ -135,125 +187,142 @@ st.caption(
     "They peer-review each other anonymously. A chairman delivers the verdict."
 )
 
-with st.form("council_form", clear_on_submit=False):
-    col1, col2 = st.columns([1, 2])
-    with col1:
+holder = st.session_state.get("holder")
+running = bool(holder and not holder["done"])
+have_result = bool(holder and holder["done"] and holder["result"])
+
+# Hide the form while a run is in flight or after a result is shown
+if not running:
+    with st.form("council_form", clear_on_submit=False):
         mode = st.selectbox(
             "Mode",
             options=["scout", "verdict", "deep"],
-            index=0,
+            index=1,
             help="scout ≈ ₹2-3 · verdict ≈ ₹7-8 · deep ≈ ₹15-17",
         )
-    with col2:
-        topic = st.text_input(
-            "Topic",
-            placeholder="e.g. Quit_job_for_startup",
-            help="Short, filename-safe — used in the PDF name.",
+        question = st.text_area(
+            "Question",
+            height=280,
+            value=st.session_state.get("last_question", ""),
+            placeholder=(
+                "Council this: [your decision in one sentence]\n\n"
+                "Context:\n"
+                "- [stake 1]\n"
+                "- [stake 2]\n"
+                "- [hard constraint]\n"
+                "- [what's pulling you toward A]\n"
+                "- [what's pulling you toward B]\n\n"
+                "[The real question, sharpened.]"
+            ),
+            help="Richer context = sharper verdict. Don't pre-load the answer.",
+        )
+        generate_pdf = st.checkbox("Generate PDF", value=True)
+        submitted = st.form_submit_button(
+            "Run council", type="primary", use_container_width=True
         )
 
-    question = st.text_area(
-        "Question",
-        height=260,
-        placeholder=(
-            "Council this: [your decision in one sentence]\n\n"
-            "Context:\n"
-            "- [stake 1]\n"
-            "- [stake 2]\n"
-            "- [hard constraint]\n"
-            "- [what's pulling you toward A]\n"
-            "- [what's pulling you toward B]\n\n"
-            "[The real question, sharpened.]"
-        ),
-        help="Richer context = sharper verdict. Don't pre-load the answer.",
-    )
+    with st.expander("Models in this mode", expanded=False):
+        cfg = council.MODEL_SETS.get(mode, council.MODEL_SETS["verdict"])
+        st.markdown(f"**Chairman:** `{cfg['chairman']}`")
+        st.markdown("**Advisors:**")
+        for name, model in zip(council.ADVISOR_NAMES, cfg["advisors"]):
+            st.markdown(f"- {name} → `{model}`")
 
-    generate_pdf = st.checkbox("Generate PDF", value=True)
-
-    submitted = st.form_submit_button("Run council", type="primary", use_container_width=True)
-
-# Show models used (just below the form so the user always sees what they'd get)
-with st.expander(f"Models in **{mode}** mode", expanded=False):
-    cfg = council.MODEL_SETS[mode]
-    st.markdown(f"**Chairman:** `{cfg['chairman']}`")
-    st.markdown("**Advisors:**")
-    for name, model in zip(council.ADVISOR_NAMES, cfg["advisors"]):
-        st.markdown(f"- {name} → `{model}`")
-
-
-# =============================================================================
-# EXECUTE
-# =============================================================================
-
-if submitted:
-    # --- validation ---
-    if not topic.strip():
-        st.error("Topic is required.")
-        st.stop()
-    if not question.strip():
-        st.error("Question is required.")
-        st.stop()
-
-    safe_topic = topic.strip()
-    if not all(c.isalnum() or c in "_-" for c in safe_topic):
-        st.error("Topic must be filename-safe: letters, digits, `_` or `-` only.")
-        st.stop()
-
-    import os
-    api_key = (
-        _secret("OPENROUTER_KEY")
-        or os.environ.get("OPENROUTER_KEY")
-        or st.session_state.get("OPENROUTER_KEY")
-    )
-    if not api_key:
-        st.error(
-            "OpenRouter key not configured. Set `OPENROUTER_KEY` in Streamlit "
-            "secrets (Cloud) or env (local)."
-        )
-        st.stop()
-
-    started = time.time()
-
-    with st.status("Running council…", expanded=True) as status:
-        st.write(f"→ 5 advisors running in parallel on **{mode}** models…")
-        try:
-            result = asyncio.run(run_council(api_key, mode, question))
-        except Exception as e:
-            status.update(label="Failed", state="error")
-            st.exception(e)
+    if submitted:
+        if not question.strip():
+            st.error("Question is required.")
             st.stop()
 
-        st.write("✓ Advisors done")
-        st.write("✓ Peer review done (anonymized)")
-        st.write("✓ Chairman synthesizing…")
-        elapsed = time.time() - started
-        status.update(label=f"✓ Verdict ready ({elapsed:.0f}s)", state="complete")
+        api_key = (
+            _secret("OPENROUTER_KEY")
+            or os.environ.get("OPENROUTER_KEY")
+            or st.session_state.get("OPENROUTER_KEY")
+        )
+        if not api_key:
+            st.error(
+                "OpenRouter key not configured. Set `OPENROUTER_KEY` in Streamlit "
+                "secrets (Cloud) or env (local)."
+            )
+            st.stop()
 
+        st.session_state["last_question"] = question
+        st.session_state["last_mode"] = mode
+        st.session_state["last_generate_pdf"] = generate_pdf
+
+        start_run(api_key, mode, question)
+        st.rerun()
+
+
+# =============================================================================
+# UI — RUNNING (with Stop button + auto-refresh)
+# =============================================================================
+
+if running:
+    elapsed = time.time() - holder["started_at"]
+    st.markdown("### 🏛️ Council in session")
+    st.info(f"⏳ {holder['stage']}  ·  {elapsed:0.0f}s elapsed")
+    if st.button("⏹ Stop", type="secondary", use_container_width=True):
+        holder["cancel_event"].set()
+        st.toast("Stopping after the current stage finishes…", icon="⏹")
+        st.rerun()
+    st.caption(
+        "Cancellation takes effect between stages, so you may wait up to ~30s "
+        "for the in-flight stage to finish."
+    )
+    time.sleep(1.0)
+    st.rerun()
+
+
+# =============================================================================
+# UI — CANCELLED / ERROR
+# =============================================================================
+
+if holder and holder["done"] and holder.get("cancelled"):
+    st.warning("Run cancelled. Your question is still in the form above — edit and try again.")
+    if st.button("Clear and start over", use_container_width=True):
+        st.session_state.pop("holder", None)
+        st.rerun()
+
+if holder and holder["done"] and holder.get("error"):
+    st.error(f"Run failed: {holder['error']}")
+    if st.button("Clear and try again", use_container_width=True):
+        st.session_state.pop("holder", None)
+        st.rerun()
+
+
+# =============================================================================
+# UI — RESULT
+# =============================================================================
+
+if have_result:
+    result = holder["result"]
+    elapsed = holder.get("finished_at", time.time()) - holder["started_at"]
+    timestamp = datetime.now()
+
+    topic = result["topic"]
+    mode = result["mode"]
     chairman_model = result["chairman_model"]
     advisor_models = result["advisor_models"]
     advisor_responses = result["advisor_responses"]
     reviews = result["reviews"]
     chairman_verdict = result["chairman_verdict"]
+    letter_map = result["letter_map"]
 
-    # --- header strip with metadata + PDF download ---
-    timestamp = datetime.now()
     st.markdown("---")
     meta_cols = st.columns([3, 2])
     with meta_cols[0]:
         st.markdown(
-            f"**Topic:** {safe_topic}  \n"
+            f"**Topic:** {topic.replace('_', ' ')}  \n"
             f"**Mode:** {mode.upper()}  \n"
             f"**Chairman:** `{chairman_model}`  \n"
             f"**Run took:** {elapsed:.1f}s"
         )
     with meta_cols[1]:
-        if generate_pdf:
-            with st.spinner("Building PDF…"):
-                pdf_bytes = build_pdf_bytes(
-                    mode, chairman_model, advisor_models, question,
-                    advisor_responses, reviews, chairman_verdict, timestamp,
-                )
+        if st.session_state.get("last_generate_pdf", True):
+            with st.spinner("Building interactive PDF…"):
+                pdf_bytes = build_pdf_bytes(result, timestamp)
             if pdf_bytes:
-                filename = f"{safe_topic}_{mode}_{timestamp.strftime('%Y%m%d_%H%M')}.pdf"
+                filename = f"{topic}_{mode}_{timestamp.strftime('%Y%m%d_%H%M')}.pdf"
                 st.download_button(
                     "📥 Download PDF",
                     data=pdf_bytes,
@@ -262,23 +331,24 @@ if submitted:
                     use_container_width=True,
                 )
 
-    # --- chairman's verdict ---
+        if st.button("🔄 New question", use_container_width=True):
+            st.session_state.pop("holder", None)
+            st.rerun()
+
     st.markdown("## 🏛️ Chairman's Verdict")
     st.markdown(chairman_verdict)
 
-    # --- advisor responses ---
     st.markdown("---")
     st.markdown("## 📋 Advisor Responses")
     for name in council.ADVISOR_NAMES:
         with st.expander(f"**{name}** · `{advisor_models[name]}`", expanded=False):
             st.markdown(advisor_responses[name])
 
-    # --- peer reviews ---
     st.markdown("---")
     st.markdown("## 🔍 Peer Reviews")
     st.caption(
-        f"Anonymization map this run: "
-        + " · ".join(f"`{L}` = {n}" for L, n in result["letter_map"].items())
+        "Anonymization map this run: "
+        + " · ".join(f"`{L}` = {n}" for L, n in letter_map.items())
     )
     for name in council.ADVISOR_NAMES:
         with st.expander(f"**{name}** reviews the council", expanded=False):

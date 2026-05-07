@@ -8,6 +8,7 @@ Edit the three values below, then run: python council.py
 import asyncio
 import os
 import random
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -152,6 +153,58 @@ async def call_openrouter(
         return f"[ERROR from {label} ({model}) — timed out after {TIMEOUT}s]"
     except Exception as e:
         return f"[ERROR from {label} ({model}) — {type(e).__name__}: {e}]"
+
+
+# =============================================================================
+# AUTO TOPIC SLUG
+# =============================================================================
+
+
+async def topic_from_question(
+    client: httpx.AsyncClient,
+    api_key: str,
+    question: str,
+) -> str:
+    """Cheap Haiku call → short snake_case label naming the decision."""
+    system = "You produce short snake_case topic labels. Output only the label, nothing else."
+    user = f"""Read the question and output a short snake_case label (2-4 words) that names the decision being asked about.
+
+Rules:
+- ASCII letters and digits only, joined by underscores
+- 2 to 4 words
+- No quotes, no explanation, just the label
+- Capture the core decision, not the surrounding context
+
+Examples:
+Q: "Council this: should I take the Microsoft offer or stay at my startup?"
+A: microsoft_offer_vs_startup
+
+Q: "Council this: do we ship the redesign Friday or push to next sprint?"
+A: ship_redesign_vs_delay
+
+Q: "Council this: should I marry Priya or wait another year?"
+A: marry_priya_vs_wait
+
+Question:
+{question[:2000]}
+
+Label:"""
+    raw = await call_openrouter(
+        client, api_key,
+        model="anthropic/claude-haiku-4.5",
+        system=system,
+        user=user,
+        temperature=0.0,
+        max_tokens=30,
+        label="topic-slug",
+    )
+    if raw.startswith("[ERROR"):
+        return "council_decision"
+    slug = raw.strip().split("\n")[0].strip()
+    slug = re.sub(r'^["\'`*_]+|["\'`*_.]+$', '', slug)
+    slug = re.sub(r'[^a-zA-Z0-9_-]+', '_', slug)
+    slug = re.sub(r'_+', '_', slug).strip('_')
+    return (slug[:60] or "council_decision")
 
 
 # =============================================================================
@@ -450,6 +503,52 @@ hr.section-divider {
 }
 p { margin: 0.25cm 0; }
 strong { color: #111; }
+
+/* PDF outline (the bookmark sidebar in PDF readers) */
+h1.cover-title       { bookmark-level: 1; bookmark-label: content(); }
+.section-label       { bookmark-level: 2; bookmark-label: content(); }
+.advisor-name        { bookmark-level: 3; bookmark-label: content(); }
+
+/* Clickable Table of Contents */
+.toc-block {
+    background: #fbfaf5;
+    border: 1px solid #e8e1cc;
+    border-radius: 4px;
+    padding: 0.5cm 0.8cm 0.6cm 0.8cm;
+    margin: 0.4cm 0 1.2cm 0;
+}
+.toc-title {
+    font-family: 'Helvetica', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-size: 9pt;
+    color: #b8860b;
+    margin-bottom: 0.3cm;
+}
+.toc, .toc ul {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+}
+.toc li {
+    font-family: 'Helvetica', 'Arial', sans-serif;
+    font-size: 10.5pt;
+    margin: 0.12cm 0;
+}
+.toc ul {
+    padding-left: 0.7cm;
+    margin-top: 0.1cm;
+}
+.toc ul li {
+    font-size: 9.5pt;
+    color: #555;
+}
+.toc a {
+    color: #1a1a1a;
+    text-decoration: none;
+    border-bottom: 1px dotted #c7bd9c;
+}
+.toc a:hover { color: #b8860b; }
 """
 
 
@@ -461,6 +560,11 @@ def topic_to_title(topic: str) -> str:
     return topic.replace("_", " ").replace("-", " ").strip()
 
 
+def _slug(s: str) -> str:
+    s = re.sub(r'[^a-zA-Z0-9]+', '-', s).strip('-').lower()
+    return s or "section"
+
+
 def build_pdf_html(
     mode: str,
     chairman_model: str,
@@ -470,6 +574,7 @@ def build_pdf_html(
     reviews: dict,
     chairman_verdict: str,
     timestamp: datetime,
+    topic: str,
 ) -> str:
     title = topic_to_title(topic)
     date_str = timestamp.strftime("%B %d, %Y · %H:%M")
@@ -481,7 +586,7 @@ def build_pdf_html(
     for name in ADVISOR_NAMES:
         body_html = md_to_html(advisor_responses[name])
         advisor_cards.append(f"""
-        <div class="advisor-card">
+        <div class="advisor-card" id="advisor-{_slug(name)}">
             <div class="advisor-name">{name}</div>
             <div class="advisor-model">{advisor_models[name]}</div>
             <div class="advisor-body">{body_html}</div>
@@ -491,11 +596,37 @@ def build_pdf_html(
     for name in ADVISOR_NAMES:
         body_html = md_to_html(reviews[name])
         review_cards.append(f"""
-        <div class="advisor-card">
+        <div class="advisor-card" id="review-{_slug(name)}">
             <div class="advisor-name">{name}</div>
             <div class="advisor-model">peer review · {advisor_models[name]}</div>
             <div class="advisor-body">{body_html}</div>
         </div>""")
+
+    advisor_toc = "\n".join(
+        f'      <li><a href="#advisor-{_slug(n)}">{n}</a></li>' for n in ADVISOR_NAMES
+    )
+    review_toc = "\n".join(
+        f'      <li><a href="#review-{_slug(n)}">{n}</a></li>' for n in ADVISOR_NAMES
+    )
+
+    toc_block = f"""
+<div class="toc-block">
+  <div class="toc-title">Contents</div>
+  <ul class="toc">
+    <li><a href="#question">The Question</a></li>
+    <li><a href="#verdict">Chairman's Verdict</a></li>
+    <li><a href="#advisors">Advisor Responses</a>
+      <ul>
+{advisor_toc}
+      </ul>
+    </li>
+    <li><a href="#reviews">Peer Reviews</a>
+      <ul>
+{review_toc}
+      </ul>
+    </li>
+  </ul>
+</div>"""
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><style>{PDF_CSS}</style></head>
@@ -504,22 +635,26 @@ def build_pdf_html(
 <h1 class="cover-title">{title}</h1>
 <div class="cover-meta">{date_str}  ·  Mode: <strong>{mode.upper()}</strong>  ·  Chairman: {chairman_model}</div>
 
-<div class="section-label">The Question</div>
+{toc_block}
+
+<div class="page-break"></div>
+
+<div class="section-label" id="question">The Question</div>
 <div class="question-box">{question}</div>
 
-<div class="section-label">Chairman's Verdict</div>
+<div class="section-label" id="verdict">Chairman's Verdict</div>
 {chairman_html}
 
 <hr class="section-divider"/>
 
 <div class="page-break"></div>
-<div class="section-label">Advisor Responses</div>
+<div class="section-label" id="advisors">Advisor Responses</div>
 {''.join(advisor_cards)}
 
 <hr class="section-divider"/>
 
 <div class="page-break"></div>
-<div class="section-label">Peer Reviews</div>
+<div class="section-label" id="reviews">Peer Reviews</div>
 {''.join(review_cards)}
 
 <div class="footer">Generated {timestamp.strftime("%Y-%m-%d %H:%M:%S")} · LLM Council ({mode.upper()})</div>
@@ -619,7 +754,7 @@ async def main():
     pdf_path = Path(__file__).parent / filename
     html = build_pdf_html(
         MODE, chairman_model, advisor_models, question,
-        advisor_responses, reviews, chairman_verdict, timestamp,
+        advisor_responses, reviews, chairman_verdict, timestamp, topic,
     )
     engine = save_pdf(html, str(pdf_path))
 
