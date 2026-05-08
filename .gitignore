@@ -219,5 +219,6 @@ __marimo__/
 
 # LLM Council artifacts and local Claude Code overrides
 *.pdf
+council_history.db
 .claude/settings.local.json
 
