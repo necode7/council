@@ -107,11 +107,40 @@ def _ensure_columns(conn) -> None:
 # =============================================================================
 #
 # Turso speaks the "Hrana" protocol. The HTTP variant accepts batched JSON
-# requests at /v2/pipeline. We wrap it in a sqlite3-shaped Connection /
-# Cursor so the rest of history.py doesn't need to know which backend is in
-# play. No external dependency: just httpx (already in requirements.txt).
+# requests at /v2/pipeline (or /v3/pipeline on newer servers). We wrap it
+# in a sqlite3-shaped Connection / Cursor so the rest of history.py doesn't
+# need to know which backend is in play. No external dependency: just httpx
+# (already in requirements.txt).
 #
 # Docs: https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md
+
+
+class TursoError(Exception):
+    """Base class for Turso-related failures. UI catches this and renders
+    via st.error so Streamlit doesn't redact the message."""
+
+
+class TursoHTTPError(TursoError):
+    def __init__(self, status: int, endpoint: str, token_preview: str, body_preview: str):
+        self.status = status
+        self.endpoint = endpoint
+        self.token_preview = token_preview
+        self.body_preview = body_preview
+        super().__init__(
+            f"Turso HTTP {status} from {endpoint}\n"
+            f"Auth token (masked): {token_preview}\n"
+            f"Response body: {body_preview}"
+        )
+
+
+class TursoHranaError(TursoError):
+    def __init__(self, code: str, message: str, endpoint: str):
+        self.code = code
+        self.message = message
+        self.endpoint = endpoint
+        super().__init__(
+            f"Turso Hrana error{f' [{code}]' if code else ''} at {endpoint}: {message}"
+        )
 
 
 def _encode_value(v):
@@ -190,9 +219,14 @@ class _TursoConn:
     is auto-committed by Turso (the Hrana pipeline opens, runs, closes)."""
 
     def __init__(self, url: str, token: str):
-        # Accept libsql:// or https://; Hrana lives at /v2/pipeline either way.
+        # Accept libsql:// or https://; Hrana lives at /vN/pipeline either way.
         host = url.replace("libsql://", "https://").rstrip("/")
+        self._host = host
+        self._token_preview = (token[:6] + "…" + token[-4:]) if len(token) > 14 else "<short>"
+        # Try v2 first, then v3 if v2 says "not found". Initial value is v2;
+        # _post() upgrades on a fresh-pipeline 404/405.
         self._endpoint = f"{host}/v2/pipeline"
+        self._tried_v3 = False
         self._headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -220,24 +254,44 @@ class _TursoConn:
             pass
 
     def _post(self, requests: list) -> dict | None:
-        resp = self._client.post(
-            self._endpoint, headers=self._headers,
-            content=json.dumps({"requests": requests}),
-        )
+        body = {"requests": requests}
+        resp = self._client.post(self._endpoint, headers=self._headers, json=body)
+
+        # Endpoint discovery: if v2 isn't found, transparently retry on v3.
+        if (resp.status_code in (404, 405)) and not self._tried_v3:
+            self._tried_v3 = True
+            self._endpoint = f"{self._host}/v3/pipeline"
+            resp = self._client.post(self._endpoint, headers=self._headers, json=body)
+
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"Turso HTTP {resp.status_code}: {resp.text[:300]}"
+            # Surface enough to diagnose without leaking the auth token.
+            body_preview = resp.text[:1000] if resp.text else "<empty body>"
+            raise TursoHTTPError(
+                status=resp.status_code,
+                endpoint=self._endpoint,
+                token_preview=self._token_preview,
+                body_preview=body_preview,
             )
-        data = resp.json()
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise TursoHTTPError(
+                status=resp.status_code,
+                endpoint=self._endpoint,
+                token_preview=self._token_preview,
+                body_preview=f"<non-JSON response: {e}>  raw={resp.text[:500]}",
+            )
+
         results = data.get("results") or []
-        # Surface any error result with a clear message.
         for r in results:
             if r.get("type") == "error":
                 err = r.get("error") or {}
                 msg = err.get("message") or "unknown error"
                 code = err.get("code") or ""
-                raise RuntimeError(f"Turso error{f' [{code}]' if code else ''}: {msg}")
-        # Return the first execute's result payload (the close is bookkeeping).
+                raise TursoHranaError(
+                    code=code, message=msg, endpoint=self._endpoint,
+                )
         for r in results:
             if r.get("type") == "ok":
                 inner = r.get("response") or {}
