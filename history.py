@@ -2,12 +2,14 @@
 Council history — durable archive of past runs.
 
 Storage backend is chosen at runtime:
-  · TURSO_DATABASE_URL + TURSO_AUTH_TOKEN env vars present → libSQL/Turso (cloud)
+  · TURSO_DATABASE_URL + TURSO_AUTH_TOKEN env vars present → Turso (cloud,
+    over HTTPS using the Hrana HTTP API; no native dependencies, just httpx)
   · Otherwise → local sqlite3 file at council_history.db
 
-Both backends share the exact same SQL schema (libSQL is SQLite-compatible).
+Both backends share the exact same SQL schema (Turso is SQLite-compatible).
 """
 
+import base64
 import json
 import os
 import re
@@ -15,31 +17,35 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import httpx
+
 DB_PATH = Path(__file__).parent / "council_history.db"
 
 # Mode-midpoint estimate matching the help text in app.py
 # (scout ≈ ₹2-3 · verdict ≈ ₹7-8 · deep ≈ ₹15-17).
 COST_BY_MODE = {"scout": 2.5, "verdict": 7.5, "deep": 16.0}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS councils (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT NOT NULL,
-    topic_slug TEXT NOT NULL,
-    mode TEXT NOT NULL,
-    question TEXT NOT NULL,
-    chairman_model TEXT NOT NULL,
-    advisor_models_json TEXT NOT NULL,
-    advisor_responses_json TEXT NOT NULL,
-    reviews_json TEXT NOT NULL,
-    letter_map_json TEXT NOT NULL,
-    chairman_verdict TEXT NOT NULL,
-    cost_estimate REAL NOT NULL,
-    interrupts_json TEXT NOT NULL DEFAULT '[]',
-    clarifications_json TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_councils_timestamp ON councils(timestamp DESC);
-"""
+SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS councils (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        topic_slug TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        question TEXT NOT NULL,
+        chairman_model TEXT NOT NULL,
+        advisor_models_json TEXT NOT NULL,
+        advisor_responses_json TEXT NOT NULL,
+        reviews_json TEXT NOT NULL,
+        letter_map_json TEXT NOT NULL,
+        chairman_verdict TEXT NOT NULL,
+        cost_estimate REAL NOT NULL,
+        interrupts_json TEXT NOT NULL DEFAULT '[]',
+        clarifications_json TEXT NOT NULL DEFAULT '[]'
+    )
+    """.strip(),
+    "CREATE INDEX IF NOT EXISTS idx_councils_timestamp ON councils(timestamp DESC)",
+]
 
 # Older local DBs may exist without the two new JSON columns. Add them
 # idempotently on connect so upgrades don't require manual migration.
@@ -50,7 +56,7 @@ _BACKFILL_COLUMNS = [
 
 
 # =============================================================================
-# CONNECTION (Turso if credentials present, else local sqlite)
+# CONNECTION (Turso over HTTPS if creds present, else local sqlite)
 # =============================================================================
 
 
@@ -72,14 +78,11 @@ def _connect():
     creds = _turso_creds()
     if creds:
         url, token = creds
-        # libsql-experimental ships a sqlite3-like API; only available on PyPI,
-        # so import lazily to avoid breaking environments that don't need it.
-        import libsql_experimental as libsql
-        conn = libsql.connect(database=url, auth_token=token)
+        conn = _TursoConn(url, token)
     else:
         conn = sqlite3.connect(str(DB_PATH))
-    conn.executescript(SCHEMA)
-    # Backfill columns on pre-existing local DBs so historic rows still load.
+    for stmt in SCHEMA_STATEMENTS:
+        conn.execute(stmt)
     _ensure_columns(conn)
     return conn
 
@@ -96,9 +99,151 @@ def _ensure_columns(conn) -> None:
             try:
                 conn.execute(f"ALTER TABLE councils ADD COLUMN {name} {decl}")
             except Exception:
-                # Column race or backend quirk — schema in CREATE TABLE will
-                # cover fresh installs anyway.
                 pass
+
+
+# =============================================================================
+# TURSO HRANA-OVER-HTTP CLIENT (sqlite3-compatible thin shim)
+# =============================================================================
+#
+# Turso speaks the "Hrana" protocol. The HTTP variant accepts batched JSON
+# requests at /v2/pipeline. We wrap it in a sqlite3-shaped Connection /
+# Cursor so the rest of history.py doesn't need to know which backend is in
+# play. No external dependency: just httpx (already in requirements.txt).
+#
+# Docs: https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md
+
+
+def _encode_value(v):
+    """Python value → Hrana value object."""
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": "1" if v else "0"}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    if isinstance(v, (bytes, bytearray)):
+        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode("ascii")}
+    return {"type": "text", "value": str(v)}
+
+
+def _decode_value(v):
+    """Hrana value object → Python value."""
+    t = v.get("type")
+    if t == "null":
+        return None
+    if t == "integer":
+        # Hrana sends integers as strings to preserve full 64-bit range.
+        return int(v.get("value", "0"))
+    if t == "float":
+        return float(v.get("value", 0.0))
+    if t == "text":
+        return v.get("value", "")
+    if t == "blob":
+        return base64.b64decode(v.get("base64", ""))
+    return v.get("value")
+
+
+class _TursoCursor:
+    """Subset of sqlite3.Cursor: fetchone, fetchall, description, lastrowid."""
+
+    def __init__(self, result: dict | None):
+        if result is None:
+            self._cols = []
+            self._rows = []
+            self.lastrowid = None
+            self.description = None
+            return
+        self._cols = result.get("cols", []) or []
+        rows_raw = result.get("rows", []) or []
+        self._rows = [
+            tuple(_decode_value(cell) for cell in row) for row in rows_raw
+        ]
+        self._idx = 0
+        last = result.get("last_insert_rowid")
+        self.lastrowid = int(last) if last not in (None, "") else None
+        # PEP-249 description: 7-tuple (name, type_code, display_size,
+        # internal_size, precision, scale, null_ok). We only fill name.
+        self.description = (
+            [(c.get("name", ""), None, None, None, None, None, None)
+             for c in self._cols]
+            if self._cols else None
+        )
+
+    def fetchone(self):
+        if not getattr(self, "_rows", None) or self._idx >= len(self._rows):
+            return None
+        row = self._rows[self._idx]
+        self._idx += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return rows
+
+
+class _TursoConn:
+    """Minimum sqlite3-shaped connection. No transactions: every execute
+    is auto-committed by Turso (the Hrana pipeline opens, runs, closes)."""
+
+    def __init__(self, url: str, token: str):
+        # Accept libsql:// or https://; Hrana lives at /v2/pipeline either way.
+        host = url.replace("libsql://", "https://").rstrip("/")
+        self._endpoint = f"{host}/v2/pipeline"
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        self._client = httpx.Client(timeout=30.0)
+
+    def execute(self, sql: str, params: tuple | list = ()) -> _TursoCursor:
+        stmt = {"sql": sql}
+        if params:
+            stmt["args"] = [_encode_value(p) for p in params]
+        result = self._post([
+            {"type": "execute", "stmt": stmt},
+            {"type": "close"},
+        ])
+        return _TursoCursor(result)
+
+    def commit(self) -> None:
+        # Each pipeline auto-commits; no-op for compat.
+        pass
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+    def _post(self, requests: list) -> dict | None:
+        resp = self._client.post(
+            self._endpoint, headers=self._headers,
+            content=json.dumps({"requests": requests}),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Turso HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        data = resp.json()
+        results = data.get("results") or []
+        # Surface any error result with a clear message.
+        for r in results:
+            if r.get("type") == "error":
+                err = r.get("error") or {}
+                msg = err.get("message") or "unknown error"
+                code = err.get("code") or ""
+                raise RuntimeError(f"Turso error{f' [{code}]' if code else ''}: {msg}")
+        # Return the first execute's result payload (the close is bookkeeping).
+        for r in results:
+            if r.get("type") == "ok":
+                inner = r.get("response") or {}
+                if inner.get("type") == "execute":
+                    return inner.get("result")
+        return None
 
 
 # =============================================================================
@@ -108,7 +253,7 @@ def _ensure_columns(conn) -> None:
 
 def _rows_to_dicts(cursor) -> list[dict]:
     """Map cursor results to dicts using cursor.description. Works on both
-    sqlite3 and libsql-experimental (neither uses sqlite3.Row by default)."""
+    sqlite3 and our Turso cursor."""
     if cursor.description is None:
         return []
     cols = [d[0] for d in cursor.description]
@@ -125,15 +270,7 @@ def cost_for_mode(mode: str) -> float:
 
 
 def save_council(result: dict, timestamp: datetime | None = None) -> int:
-    """
-    Persist a completed council run. `result` matches the dict produced by
-    app.py's _run_pipeline (or the equivalent assembled in council.py main).
-
-    Required keys: question, mode, topic, chairman_model, advisor_models,
-                   advisor_responses, reviews, letter_map, chairman_verdict.
-    Optional: interrupts (list[dict]), clarifications (list[dict]).
-    Returns the new row id.
-    """
+    """Persist a completed council run. Returns the new row id."""
     ts = (timestamp or datetime.now()).isoformat(timespec="seconds")
     cost = cost_for_mode(result["mode"])
     interrupts = result.get("interrupts", []) or []
@@ -166,7 +303,7 @@ def save_council(result: dict, timestamp: datetime | None = None) -> int:
             ),
         )
         row = cur.fetchone()
-        new_id = row[0] if row else None
+        new_id = row[0] if row else cur.lastrowid
         conn.commit()
         return int(new_id)
     finally:
@@ -177,7 +314,6 @@ def save_council(result: dict, timestamp: datetime | None = None) -> int:
 
 
 def _decode(d: dict) -> dict:
-    """Decode JSON columns and rename keys to drop the _json suffix."""
     out = dict(d)
     for k in (
         "advisor_models",
@@ -188,12 +324,13 @@ def _decode(d: dict) -> dict:
         "clarifications",
     ):
         raw = out.pop(f"{k}_json", None)
-        out[k] = json.loads(raw) if raw else ([] if k in ("interrupts", "clarifications") else {})
+        out[k] = json.loads(raw) if raw else (
+            [] if k in ("interrupts", "clarifications") else {}
+        )
     return out
 
 
 def list_councils(limit: int | None = None) -> list[dict]:
-    """Newest first."""
     sql = "SELECT * FROM councils ORDER BY timestamp DESC, id DESC"
     params: tuple = ()
     if limit is not None:
@@ -263,7 +400,6 @@ def _tokenize(text: str) -> set[str]:
 
 
 def _overlap_coeff(a: set[str], b: set[str]) -> float:
-    """Containment / overlap coefficient: |A∩B| / min(|A|,|B|)."""
     if not a or not b:
         return 0.0
     return len(a & b) / min(len(a), len(b))
