@@ -66,7 +66,7 @@ MODEL_SETS = {
         "chairman": "anthropic/claude-sonnet-4.6",
         "advisors": [
             "openai/gpt-5.4",
-            "google/gemini-3-pro-preview",
+            "google/gemini-3.1-pro-preview",
             "x-ai/grok-4.3",
             "deepseek/deepseek-v4-flash",
             "anthropic/claude-sonnet-4.6",
