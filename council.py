@@ -5,6 +5,7 @@ then a chairman model synthesizes a final verdict.
 Edit the three values below, then run: python council.py
 """
 
+import argparse
 import asyncio
 import os
 import random
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import httpx
 import markdown2
+
+import history
 
 # =============================================================================
 # USER EDITS ONLY THESE THREE
@@ -806,6 +809,26 @@ async def main():
     )
 
     timestamp = datetime.now()
+
+    try:
+        new_id = history.save_council(
+            {
+                "question": question,
+                "mode": MODE,
+                "topic": topic,
+                "chairman_model": chairman_model,
+                "advisor_models": advisor_models,
+                "advisor_responses": advisor_responses,
+                "reviews": reviews,
+                "letter_map": letter_map,
+                "chairman_verdict": chairman_verdict,
+            },
+            timestamp,
+        )
+        print(f"\n💾 Saved to history as #{new_id}  (council_history.db)")
+    except Exception as e:
+        print(f"[history save failed: {e}]")
+
     filename = f"{topic}_{MODE}_{timestamp.strftime('%Y%m%d_%H%M')}.pdf"
     pdf_path = Path(__file__).parent / filename
     html = build_pdf_html(
@@ -824,5 +847,77 @@ async def main():
     print(f"\n   Full path: {pdf_path}\n")
 
 
+# =============================================================================
+# CLI — HISTORY SUB-COMMANDS
+# =============================================================================
+
+
+def cli_history(limit: int = 10) -> None:
+    rows = history.list_councils(limit=limit)
+    if not rows:
+        print("No councils saved yet. Run one to start your archive.")
+        return
+    print()
+    print(DIVIDER)
+    print(f"  COUNCIL HISTORY  ·  last {len(rows)}")
+    print(DIVIDER)
+    for r in rows:
+        title = topic_to_title(r["topic_slug"])
+        print(
+            f"  [{r['id']:>3}]  {r['timestamp']}  "
+            f"{r['mode'].upper():<7}  ₹{r['cost_estimate']:>5.1f}  ·  {title}"
+        )
+    print(DIVIDER)
+    print(f"  Recall a run with:  python council.py --recall <id>")
+    print()
+
+
+def cli_recall(council_id: int) -> None:
+    row = history.get_council(council_id)
+    if not row:
+        print(f"No council with id {council_id}.")
+        sys.exit(1)
+    print()
+    print(DIVIDER)
+    print(f"  COUNCIL #{row['id']}  ·  {row['timestamp']}  ·  {row['mode'].upper()}")
+    print(DIVIDER)
+    print(f"  Topic:    {row['topic_slug']}")
+    print(f"  Chairman: {row['chairman_model']}")
+    print(f"  Cost:     ₹{row['cost_estimate']:.1f}  (mode estimate)")
+    print(DIVIDER)
+    print("\nQUESTION:")
+    print(row["question"])
+    print_terminal_report(
+        row["mode"],
+        row["advisor_models"],
+        row["chairman_model"],
+        row["question"],
+        row["advisor_responses"],
+        row["reviews"],
+        row["chairman_verdict"],
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        description="LLM Council — five advisors debate, chairman decides.",
+    )
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Print the last 10 councils from local history and exit.",
+    )
+    parser.add_argument(
+        "--recall",
+        type=int,
+        metavar="ID",
+        help="Print a specific past council in full and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.history:
+        cli_history()
+    elif args.recall is not None:
+        cli_recall(args.recall)
+    else:
+        asyncio.run(main())
