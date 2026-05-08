@@ -472,10 +472,13 @@ with tab_council:
             help="Richer context = sharper verdict. Don't pre-load the answer.",
         )
 
-        # Similarity check
+        # Similarity check (best-effort — never let a backend failure block the form)
         q_stripped = question.strip()
         if q_stripped and len(q_stripped) > 30:
-            matches = history.find_similar(q_stripped, threshold=0.6)
+            try:
+                matches = history.find_similar(q_stripped, threshold=0.6)
+            except Exception:
+                matches = []
             if matches:
                 sim, top_row = matches[0]
                 st.warning(
@@ -777,7 +780,21 @@ with tab_council:
 # =============================================================================
 
 with tab_history:
-    rows = history.list_councils()
+    try:
+        rows = history.list_councils()
+    except history.TursoError as e:
+        st.error(
+            "**History backend (Turso) error**\n\n```\n"
+            f"{e}\n"
+            "```\n\n"
+            "Common causes: wrong DB URL, expired/revoked token, or DB region "
+            "mismatch. Check your Streamlit secrets against the values in your "
+            "Turso dashboard."
+        )
+        rows = []
+    except Exception as e:
+        st.error(f"Couldn't load history: `{type(e).__name__}: {e}`")
+        rows = []
 
     if not rows:
         st.info("No past councils yet. Run one to start your archive.")
