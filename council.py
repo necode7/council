@@ -7,10 +7,12 @@ Edit the three values below, then run: python council.py
 
 import argparse
 import asyncio
+import json
 import os
 import random
 import re
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +20,13 @@ import httpx
 import markdown2
 
 import history
+
+
+# Raised when the user clicks Stop / cancels mid-run. Defined here (not in
+# app.py) so council-level helpers — particularly interrupt waiters — can
+# propagate cancellation cleanly.
+class Cancelled(Exception):
+    pass
 
 # =============================================================================
 # USER EDITS ONLY THESE THREE
@@ -105,8 +114,212 @@ PERSONAS = {
 
 ADVISOR_NAMES = list(PERSONAS.keys())
 
+# Short role labels for UI subtitles (interrupt cards).
+PERSONA_ROLES = {
+    "Contrarian": "stress-tests for failure modes",
+    "First Principles Thinker": "rebuilds the problem from scratch",
+    "Expansionist": "hunts for hidden upside",
+    "Outsider": "catches the curse of knowledge",
+    "Executor": "asks 'what do you do Monday morning?'",
+}
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TIMEOUT = 120.0
+
+# =============================================================================
+# INTERRUPT PROTOCOL (Feature B)
+# =============================================================================
+
+INTERRUPT_INSTRUCTION = """
+
+If — and only if — you genuinely need a clarification before you can give useful advice, output ONLY this JSON object as your entire response (nothing before, nothing after):
+{"interrupt": true, "question": "<your question to the user>", "options": ["<option 1>", "<option 2>", "<option 3>"], "allow_freetext": true}
+
+Use this only when the answer would materially change your advice. Most questions don't need it. If you can give competent advice with what you already have, do that instead. Do not interrupt for trivial reasons. You get only one interrupt per response."""
+
+
+def parse_interrupt(response: str) -> dict | None:
+    """Detect and parse an interrupt JSON block. Returns a normalized dict
+    {question, options, allow_freetext} or None if not an interrupt."""
+    if not response:
+        return None
+    text = response.strip()
+    # Strip optional code fences
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    if not text.startswith("{") or '"interrupt"' not in text:
+        return None
+    # Walk to the matching closing brace (handles trailing junk).
+    depth = 0
+    end = -1
+    in_str = False
+    esc = False
+    for i, c in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end < 0:
+        return None
+    try:
+        obj = json.loads(text[:end])
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or not obj.get("interrupt"):
+        return None
+    q = obj.get("question")
+    if not isinstance(q, str) or not q.strip():
+        return None
+    options = obj.get("options")
+    if not isinstance(options, list):
+        options = []
+    options = [str(o).strip() for o in options if str(o).strip()][:6]
+    return {
+        "question": q.strip(),
+        "options": options,
+        "allow_freetext": bool(obj.get("allow_freetext", True)),
+    }
+
+
+# =============================================================================
+# CLARIFICATION GENERATOR (Feature A)
+# =============================================================================
+
+CLARIFICATION_SYSTEM = (
+    "You generate clarifying questions to ask before a 5-person advisory "
+    "council deliberates on a user's decision. You output strict JSON only — "
+    "no preamble, no explanation, no code fences."
+)
+
+CLARIFICATION_USER_TMPL = """Read the user's question below and identify 3 to 5 clarifying questions whose answers would materially change the advice the council can give. Probe stakes, hard constraints, the alternatives the user hasn't shared, or hidden assumptions. Don't ask trivial demographic or restating questions.
+
+Output ONLY a JSON array of 3-5 objects in this exact format:
+[
+  {{"question": "...", "options": ["...", "..."], "allow_freetext": true}},
+  ...
+]
+
+Rules:
+- "options" is 2-4 short, distinct possible answers (or [] if free-form is the only sensible response)
+- "allow_freetext" is true if a custom answer is likely; false if the options cover the space
+- Each question must be specific to this user's question — not generic
+- 3 to 5 items, no more, no less
+
+User's question:
+\"\"\"
+{question}
+\"\"\"
+
+JSON:"""
+
+
+def _parse_clarification_questions(raw: str) -> list[dict]:
+    if not raw:
+        return []
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    # Find first '[' through matching ']'
+    start = text.find("[")
+    if start < 0:
+        return []
+    depth = 0
+    end = -1
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end < 0:
+        return []
+    try:
+        arr = json.loads(text[start:end])
+    except Exception:
+        return []
+    if not isinstance(arr, list):
+        return []
+    out: list[dict] = []
+    for item in arr:
+        if not isinstance(item, dict):
+            continue
+        q = item.get("question")
+        if not isinstance(q, str) or not q.strip():
+            continue
+        opts = item.get("options")
+        if not isinstance(opts, list):
+            opts = []
+        opts = [str(o).strip() for o in opts if str(o).strip()][:6]
+        out.append({
+            "question": q.strip(),
+            "options": opts,
+            "allow_freetext": bool(item.get("allow_freetext", True)),
+        })
+    return out[:5]
+
+
+async def _generate_clarification_questions_async(
+    api_key: str, question: str
+) -> list[dict]:
+    async with httpx.AsyncClient() as client:
+        raw = await call_openrouter(
+            client, api_key,
+            model="anthropic/claude-haiku-4.5",
+            system=CLARIFICATION_SYSTEM,
+            user=CLARIFICATION_USER_TMPL.format(question=question[:3000]),
+            temperature=0.3,
+            max_tokens=1500,
+            label="clarify-gen",
+        )
+    return _parse_clarification_questions(raw)
+
+
+def generate_clarification_questions(api_key: str, question: str) -> list[dict]:
+    """Sync wrapper for use from Streamlit's main thread."""
+    return asyncio.run(_generate_clarification_questions_async(api_key, question))
+
+
+def inject_clarifications(question: str, qa_pairs: list[tuple[str, str]]) -> str:
+    """Build the augmented prompt sent into the pipeline. The original
+    question stays first; clarification Q&A appears as labelled context."""
+    if not qa_pairs:
+        return question
+    lines = ["", "--- USER CLARIFICATIONS (asked before deliberation) ---"]
+    for i, (q, a) in enumerate(qa_pairs, 1):
+        lines.append(f"Q{i}: {q}")
+        lines.append(f"A{i}: {a}")
+    lines.append("--- END CLARIFICATIONS ---")
+    return question + "\n".join(["\n"] + lines)
 
 # =============================================================================
 # OPENROUTER CALL
@@ -247,13 +460,97 @@ Label:"""
 # =============================================================================
 
 
+async def _call_with_interrupt(
+    client: httpx.AsyncClient,
+    api_key: str,
+    *,
+    model: str,
+    system: str,
+    user: str,
+    label: str,
+    temperature: float,
+    max_tokens: int,
+    holder: dict | None,
+    advisor_name: str,
+    stage: str,
+) -> str:
+    """Make a call to the advisor/reviewer; if it returns an interrupt JSON
+    block AND holder is provided, register the interrupt, wait for the
+    user's answer, then re-run with the answer injected (max 1 interrupt
+    per call). Other coroutines continue running while we await the user."""
+    sys_for_call = system + (INTERRUPT_INSTRUCTION if holder is not None else "")
+    response = await call_openrouter(
+        client, api_key, model, sys_for_call, user,
+        temperature=temperature, max_tokens=max_tokens, label=label,
+    )
+    if holder is None:
+        return response
+
+    interrupt = parse_interrupt(response)
+    if not interrupt:
+        return response
+
+    answer_event = threading.Event()
+    holder.setdefault("interrupts_pending", {})
+    holder.setdefault("interrupts_order", [])
+    holder.setdefault("interrupts_log", [])
+
+    key = label  # unique: advisor names are unique, "Name (review)" too
+    holder["interrupts_pending"][key] = {
+        "key": key,
+        "advisor_name": advisor_name,
+        "stage": stage,
+        "question": interrupt["question"],
+        "options": interrupt["options"],
+        "allow_freetext": interrupt["allow_freetext"],
+        "answer": None,
+        "event": answer_event,
+    }
+    holder["interrupts_order"].append(key)
+
+    cancel_event = holder.get("cancel_event")
+    while not answer_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise Cancelled()
+        await asyncio.sleep(0.4)
+
+    answer_text = (
+        holder["interrupts_pending"][key].get("answer") or "(user skipped)"
+    )
+    holder["interrupts_log"].append({
+        "advisor": advisor_name,
+        "stage": stage,
+        "question": interrupt["question"],
+        "answer": answer_text,
+    })
+    holder["interrupts_pending"].pop(key, None)
+    if key in holder["interrupts_order"]:
+        holder["interrupts_order"].remove(key)
+
+    # One-shot: do NOT pass INTERRUPT_INSTRUCTION on the resume call.
+    augmented_user = (
+        user.rstrip()
+        + "\n\n--- YOUR EARLIER CLARIFICATION ---\n"
+        + f"You asked: {interrupt['question']}\n"
+        + f"User answered: {answer_text}\n"
+        + "Now provide your full advice."
+    )
+    return await call_openrouter(
+        client, api_key, model, system, augmented_user,
+        temperature=temperature, max_tokens=max_tokens,
+        label=f"{label} (post-interrupt)",
+    )
+
+
 async def run_advisors(
     client: httpx.AsyncClient,
     api_key: str,
     advisor_models: dict,
     question: str,
+    holder: dict | None = None,
 ) -> dict:
-    """advisor_models: {advisor_name: model_id}.  Returns {advisor_name: response}."""
+    """advisor_models: {advisor_name: model_id}.  Returns {advisor_name: response}.
+    If `holder` is provided, advisors may interrupt with a clarifying question."""
     tasks = []
     for name in ADVISOR_NAMES:
         model = advisor_models[name]
@@ -262,9 +559,11 @@ async def run_advisors(
             "throat-clearing. Speak directly to the user about their decision."
         )
         tasks.append(
-            call_openrouter(
-                client, api_key, model, system, question,
-                temperature=0.7, max_tokens=1200, label=name,
+            _call_with_interrupt(
+                client, api_key,
+                model=model, system=system, user=question, label=name,
+                temperature=0.7, max_tokens=1200,
+                holder=holder, advisor_name=name, stage="advisor",
             )
         )
     results = await asyncio.gather(*tasks)
@@ -294,8 +593,10 @@ async def run_peer_review(
     advisor_models: dict,
     advisor_responses: dict,
     question: str,
+    holder: dict | None = None,
 ) -> tuple[dict, dict]:
-    """Each advisor reviews all 5 anonymized responses. Returns (reviews, letter_map)."""
+    """Each advisor reviews all 5 anonymized responses. Returns (reviews, letter_map).
+    If `holder` is provided, reviewers may interrupt with a clarifying question."""
     letter_to_response, letter_to_name = anonymize(advisor_responses)
     anon_block = build_anonymized_block(letter_to_response)
 
@@ -322,9 +623,12 @@ Be concise. Aim for 3 short paragraphs total — one per question.
             "honest, specific, and brief. Reference responses by their letter (A-E)."
         )
         tasks.append(
-            call_openrouter(
-                client, api_key, model, system, review_prompt,
-                temperature=0.7, max_tokens=1000, label=f"{name} (review)",
+            _call_with_interrupt(
+                client, api_key,
+                model=model, system=system, user=review_prompt,
+                label=f"{name} (review)",
+                temperature=0.7, max_tokens=1000,
+                holder=holder, advisor_name=name, stage="review",
             )
         )
     results = await asyncio.gather(*tasks)
@@ -584,6 +888,46 @@ h1.cover-title       { bookmark-level: 1; bookmark-label: content(); }
     border-bottom: 1px dotted #c7bd9c;
 }
 .toc a:hover { color: #b8860b; }
+
+/* Clarifications & interrupts (Feature A & B) */
+.qa-block {
+    margin: 0.4cm 0 0.8cm 0;
+    background: #fbfaf5;
+    border: 1px solid #e8e1cc;
+    border-radius: 4px;
+    padding: 0.5cm 0.7cm;
+}
+.qa-block-title {
+    font-family: 'Helvetica', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    font-size: 8.5pt;
+    color: #b8860b;
+    margin-bottom: 0.25cm;
+}
+.qa-pair {
+    margin: 0.25cm 0;
+    padding: 0.15cm 0;
+    border-bottom: 1px dotted #e8e1cc;
+}
+.qa-pair:last-child { border-bottom: none; }
+.qa-meta {
+    font-family: 'Helvetica', sans-serif;
+    font-size: 8.5pt;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 0.1cm;
+}
+.qa-q {
+    font-weight: 600;
+    color: #2a2a2a;
+    margin: 0.1cm 0;
+}
+.qa-a {
+    color: #444;
+    margin: 0.1cm 0 0 0.4cm;
+}
 """
 
 
@@ -624,6 +968,57 @@ def _slug(s: str) -> str:
     return s or "section"
 
 
+def _build_clarifications_block(clarifications: list[dict]) -> str:
+    """HTML for Feature A's pre-deliberation clarifications."""
+    if not clarifications:
+        return ""
+    items = []
+    for c in clarifications:
+        q = (c.get("question") or "").strip()
+        a = (c.get("answer") or "").strip()
+        if not q:
+            continue
+        items.append(
+            f"<div class=\"qa-pair\"><div class=\"qa-q\">Q. {q}</div>"
+            f"<div class=\"qa-a\">A. {a}</div></div>"
+        )
+    if not items:
+        return ""
+    return (
+        '<div class="qa-block"><div class="qa-block-title">'
+        'Pre-deliberation clarifications</div>'
+        + "".join(items) + "</div>"
+    )
+
+
+def _build_interrupts_block(interrupts: list[dict]) -> str:
+    """HTML for Feature B's mid-deliberation advisor interrupts."""
+    if not interrupts:
+        return ""
+    items = []
+    for i in interrupts:
+        advisor = (i.get("advisor") or "").strip() or "An advisor"
+        stage = (i.get("stage") or "advisor").strip()
+        q = (i.get("question") or "").strip()
+        a = (i.get("answer") or "").strip()
+        if not q:
+            continue
+        stage_label = "advisor" if stage == "advisor" else "peer reviewer"
+        items.append(
+            f"<div class=\"qa-pair\">"
+            f"<div class=\"qa-meta\">{advisor} · {stage_label}</div>"
+            f"<div class=\"qa-q\">Q. {q}</div>"
+            f"<div class=\"qa-a\">A. {a}</div></div>"
+        )
+    if not items:
+        return ""
+    return (
+        '<div class="qa-block"><div class="qa-block-title">'
+        'Mid-deliberation clarifications</div>'
+        + "".join(items) + "</div>"
+    )
+
+
 def build_pdf_html(
     mode: str,
     chairman_model: str,
@@ -634,6 +1029,8 @@ def build_pdf_html(
     chairman_verdict: str,
     timestamp: datetime,
     topic: str,
+    clarifications: list[dict] | None = None,
+    interrupts: list[dict] | None = None,
 ) -> str:
     title = topic_to_title(topic)
     date_str = timestamp.strftime("%B %d, %Y · %H:%M")
@@ -668,11 +1065,14 @@ def build_pdf_html(
         f'      <li><a href="#review-{_slug(n)}">{n}</a></li>' for n in ADVISOR_NAMES
     )
 
+    clarifications_html = _build_clarifications_block(clarifications or [])
+    interrupts_html = _build_interrupts_block(interrupts or [])
+
     toc_block = f"""
 <div class="toc-block">
   <div class="toc-title">Contents</div>
   <ul class="toc">
-    <li><a href="#question">The Question</a></li>
+    <li><a href="#question">Question &amp; Context</a></li>
     <li><a href="#verdict">Chairman's Verdict</a></li>
     <li><a href="#advisors">Advisor Responses</a>
       <ul>
@@ -698,8 +1098,10 @@ def build_pdf_html(
 
 <div class="page-break"></div>
 
-<div class="section-label" id="question">The Question</div>
+<div class="section-label" id="question">Question &amp; Context</div>
 <div class="question-box">{question}</div>
+{clarifications_html}
+{interrupts_html}
 
 <div class="section-label" id="verdict">Chairman's Verdict</div>
 {chairman_html}

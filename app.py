@@ -4,8 +4,10 @@ LLM Council — Streamlit web app.
 Usage:
     Local:  streamlit run app.py
     Cloud:  push to GitHub → deploy on share.streamlit.io with secrets:
-              OPENROUTER_KEY = "sk-or-v1-..."
-              APP_PASSWORD   = "<your password>"
+              OPENROUTER_KEY      = "sk-or-v1-..."
+              APP_PASSWORD        = "<your password>"
+              TURSO_DATABASE_URL  = "libsql://..."   # optional, enables durable history
+              TURSO_AUTH_TOKEN    = "..."            # optional
 """
 
 import asyncio
@@ -21,7 +23,28 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 import council
+from council import Cancelled
 import history
+
+
+# =============================================================================
+# SECRETS — hydrate into os.environ early so history.py picks up Turso creds
+# regardless of where it's imported from (Streamlit context vs CLI).
+# =============================================================================
+
+
+def _early_secret(key: str) -> str:
+    try:
+        return st.secrets.get(key, "")
+    except Exception:
+        return ""
+
+
+for _k in ("TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN"):
+    if not os.environ.get(_k):
+        _v = _early_secret(_k)
+        if _v:
+            os.environ[_k] = _v
 
 
 # =============================================================================
@@ -77,11 +100,15 @@ if not require_password():
 # COUNCIL PIPELINE (with progress + cancellation)
 # =============================================================================
 
-class Cancelled(Exception):
-    pass
 
-
-async def _run_pipeline(api_key: str, mode: str, question: str, holder: dict):
+async def _run_pipeline(
+    api_key: str,
+    mode: str,
+    original_question: str,
+    augmented_question: str,
+    clarifications: list[dict],
+    holder: dict,
+):
     config = council.MODEL_SETS[mode]
     chairman_model = config["chairman"]
     advisor_models = dict(zip(council.ADVISOR_NAMES, config["advisors"]))
@@ -93,23 +120,28 @@ async def _run_pipeline(api_key: str, mode: str, question: str, holder: dict):
 
     async with httpx.AsyncClient() as client:
         holder["stage"] = "Reading your question…"
-        topic = await council.topic_from_question(client, api_key, question)
+        # Topic is derived from the ORIGINAL user question — we don't want
+        # the clarification block bleeding into the slug.
+        topic = await council.topic_from_question(client, api_key, original_question)
         holder["topic"] = topic
         check_cancel()
 
         holder["stage"] = "5 advisors deliberating in parallel…"
-        advisors = await council.run_advisors(client, api_key, advisor_models, question)
+        advisors = await council.run_advisors(
+            client, api_key, advisor_models, augmented_question, holder=holder
+        )
         check_cancel()
 
         holder["stage"] = "Anonymous peer review…"
         reviews, letter_map = await council.run_peer_review(
-            client, api_key, advisor_models, advisors, question
+            client, api_key, advisor_models, advisors, augmented_question,
+            holder=holder,
         )
         check_cancel()
 
         holder["stage"] = "Chairman delivering verdict…"
         verdict = await council.run_chairman(
-            client, api_key, chairman_model, question, advisors, reviews
+            client, api_key, chairman_model, augmented_question, advisors, reviews
         )
 
     return {
@@ -121,12 +153,26 @@ async def _run_pipeline(api_key: str, mode: str, question: str, holder: dict):
         "reviews": reviews,
         "letter_map": letter_map,
         "chairman_verdict": verdict,
-        "question": question,
+        # Display/PDF/history use the ORIGINAL question; clarifications are
+        # rendered as a separate, structured Q&A list.
+        "question": original_question,
+        "clarifications": clarifications,
+        "interrupts": list(holder.get("interrupts_log", [])),
     }
 
 
-def start_run(api_key: str, mode: str, question: str):
-    """Spawn a thread that runs the pipeline and updates session_state['holder']."""
+def start_run(
+    api_key: str,
+    mode: str,
+    original_question: str,
+    clarifications: list[dict] | None = None,
+):
+    """Spawn a thread that runs the pipeline and updates session_state['holder'].
+    `clarifications` is a list of {question, answer} from Feature A."""
+    clarifications = clarifications or []
+    qa_pairs = [(c["question"], c["answer"]) for c in clarifications]
+    augmented_question = council.inject_clarifications(original_question, qa_pairs)
+
     holder = {
         "stage": "Starting…",
         "started_at": time.time(),
@@ -136,12 +182,20 @@ def start_run(api_key: str, mode: str, question: str):
         "error": None,
         "cancel_event": threading.Event(),
         "topic": None,
+        # Feature B — pending advisor/reviewer interrupts. The pipeline thread
+        # writes here; the UI thread renders + answers.
+        "interrupts_pending": {},
+        "interrupts_order": [],
+        "interrupts_log": [],
     }
     st.session_state["holder"] = holder
 
     def runner():
         try:
-            result = asyncio.run(_run_pipeline(api_key, mode, question, holder))
+            result = asyncio.run(_run_pipeline(
+                api_key, mode, original_question, augmented_question,
+                clarifications, holder,
+            ))
             holder["result"] = result
             try:
                 holder["saved_id"] = history.save_council(result, datetime.now())
@@ -171,6 +225,8 @@ def build_pdf_bytes(result: dict, timestamp: datetime) -> bytes | None:
         result["chairman_verdict"],
         timestamp,
         result["topic"],
+        clarifications=result.get("clarifications", []),
+        interrupts=result.get("interrupts", []),
     )
     try:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -180,6 +236,96 @@ def build_pdf_bytes(result: dict, timestamp: datetime) -> bytes | None:
     except Exception as e:
         st.warning(f"PDF generation failed: {e}")
         return None
+
+
+# =============================================================================
+# INTERACTIVE QUESTION CARD (Feature A & B share this)
+# =============================================================================
+
+
+def _combine_answer(chosen: list[str], freetext: str) -> str:
+    """Merge selected options + freetext into a single answer string."""
+    parts = []
+    if chosen:
+        parts.append(" / ".join(chosen))
+    if freetext.strip():
+        parts.append(freetext.strip())
+    return " — ".join(parts) if parts else ""
+
+
+def _render_question_card(
+    *,
+    asker: str,
+    asker_role: str | None,
+    question_text: str,
+    options: list[str],
+    allow_freetext: bool,
+    key_prefix: str,
+    on_submit,           # callable(answer: str) -> None
+    on_skip,             # callable() -> None
+    show_skip_remaining: bool = False,
+    on_skip_remaining=None,
+):
+    """Render a Claude-style question card (used by Feature A and Feature B)."""
+    with st.container(border=True):
+        st.markdown(f"**{asker} asks:**")
+        if asker_role:
+            st.caption(asker_role)
+        st.markdown(f"### {question_text}")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if options:
+                chosen = st.multiselect(
+                    "Pick one or more options",
+                    options,
+                    key=f"{key_prefix}_opts",
+                )
+            else:
+                chosen = []
+                st.caption("_No predefined options — please type your answer._")
+        with col2:
+            free = st.text_area(
+                "Your own answer" if allow_freetext else "Add nuance (optional)",
+                key=f"{key_prefix}_free",
+                height=120,
+            )
+
+        bcols = st.columns([2, 1, 2] if show_skip_remaining else [2, 1])
+        with bcols[0]:
+            if st.button(
+                "Submit answer",
+                type="primary",
+                key=f"{key_prefix}_submit",
+                use_container_width=True,
+            ):
+                answer = _combine_answer(chosen, free)
+                if not answer:
+                    st.warning("Pick an option or write something before submitting.")
+                else:
+                    on_submit(answer)
+        with bcols[1]:
+            if st.button(
+                "Skip",
+                key=f"{key_prefix}_skip",
+                use_container_width=True,
+            ):
+                on_skip()
+        if show_skip_remaining and on_skip_remaining is not None:
+            with bcols[2]:
+                if st.button(
+                    "Skip remaining questions",
+                    key=f"{key_prefix}_skip_all",
+                    use_container_width=True,
+                ):
+                    on_skip_remaining()
+
+
+def _render_answer_card(idx: int, q_text: str, answer: str):
+    """Small card showing a previously-answered question."""
+    with st.container(border=True):
+        st.caption(f"Q{idx + 1}: {q_text}")
+        st.markdown(f"_{answer}_")
 
 
 # =============================================================================
@@ -203,17 +349,99 @@ with tab_council:
     holder = st.session_state.get("holder")
     running = bool(holder and not holder["done"])
     have_result = bool(holder and holder["done"] and holder["result"])
+    clarify_state = st.session_state.get("clarify_state")
+    in_clarify = clarify_state is not None and not running and not have_result
 
-    # Hide the form while a run is in flight or after a result is shown.
-    #
-    # We're NOT using st.form here on purpose — forms batch their values until
-    # submit, which means the "Models in this mode" expander wouldn't update
-    # when the user changes the Mode dropdown. Outside of a form, every widget
-    # change reruns the script and keeps the expander in sync.
-    if not running and not have_result:
+    # ---- CLARIFICATION PHASE (Feature A) ---------------------------------
+    if in_clarify:
+        # Step 1: generate questions if we don't have them yet.
+        if clarify_state["phase"] == "generating":
+            with st.spinner("The council is preparing some questions for you…"):
+                try:
+                    qs = council.generate_clarification_questions(
+                        clarify_state["api_key"], clarify_state["original_question"]
+                    )
+                except Exception as e:
+                    st.error(
+                        f"Couldn't generate clarifying questions: {e}. "
+                        f"Running without clarification."
+                    )
+                    qs = []
+                clarify_state["questions"] = qs
+                clarify_state["phase"] = "asking" if qs else "done"
+            st.rerun()
+
+        elif clarify_state["phase"] == "asking":
+            questions = clarify_state["questions"]
+            answers = clarify_state["answers"]
+            idx = clarify_state["current_idx"]
+
+            st.markdown("### 🤔 The council has a few questions first")
+            st.caption(
+                f"Question {min(idx + 1, len(questions))} of {len(questions)}"
+            )
+
+            # Trail of prior answers
+            for i in range(len(answers)):
+                _render_answer_card(i, questions[i]["question"], answers[i])
+
+            current_q = questions[idx]
+
+            def _submit(answer: str):
+                clarify_state["answers"].append(answer)
+                clarify_state["current_idx"] += 1
+                if clarify_state["current_idx"] >= len(questions):
+                    clarify_state["phase"] = "done"
+                st.rerun()
+
+            def _skip():
+                clarify_state["answers"].append("(user skipped)")
+                clarify_state["current_idx"] += 1
+                if clarify_state["current_idx"] >= len(questions):
+                    clarify_state["phase"] = "done"
+                st.rerun()
+
+            def _skip_all():
+                clarify_state["phase"] = "done"
+                st.rerun()
+
+            _render_question_card(
+                asker="The Council",
+                asker_role=None,
+                question_text=current_q["question"],
+                options=current_q["options"],
+                allow_freetext=current_q["allow_freetext"],
+                key_prefix=f"clarify_{idx}",
+                on_submit=_submit,
+                on_skip=_skip,
+                show_skip_remaining=True,
+                on_skip_remaining=_skip_all,
+            )
+
+            if st.button("Cancel clarification", key="clarify_cancel"):
+                del st.session_state["clarify_state"]
+                st.rerun()
+
+        elif clarify_state["phase"] == "done":
+            # Build the clarifications record (only Q&As that were actually asked
+            # — if user skip-all'd early, only the answered ones are kept).
+            clarifications = []
+            for i, ans in enumerate(clarify_state["answers"]):
+                clarifications.append({
+                    "question": clarify_state["questions"][i]["question"],
+                    "answer": ans,
+                })
+            api_key = clarify_state["api_key"]
+            mode = clarify_state["mode"]
+            original_q = clarify_state["original_question"]
+            del st.session_state["clarify_state"]
+            start_run(api_key, mode, original_q, clarifications=clarifications)
+            st.rerun()
+
+    # ---- INPUT FORM ------------------------------------------------------
+    elif not running and not have_result:
         # If a previous run set this flag, clear the question textarea state
-        # BEFORE the widget renders. Streamlit only honours session_state writes
-        # to a widget's key when the write happens before the widget is created.
+        # BEFORE the widget renders.
         if st.session_state.get("_clear_question"):
             st.session_state["question_text"] = ""
             del st.session_state["_clear_question"]
@@ -244,7 +472,7 @@ with tab_council:
             help="Richer context = sharper verdict. Don't pre-load the answer.",
         )
 
-        # Similarity check — runs on every rerun (cheap; local SQLite, ≤100s of rows).
+        # Similarity check
         q_stripped = question.strip()
         if q_stripped and len(q_stripped) > 30:
             matches = history.find_similar(q_stripped, threshold=0.6)
@@ -257,18 +485,40 @@ with tab_council:
                     f"{top_row['timestamp']}). Check the History tab."
                 )
 
+        # Feature A — clarification toggle
+        clarify_choice = st.radio(
+            "How would you like to proceed?",
+            options=["Jump straight in", "Let the council ask me first"],
+            horizontal=True,
+            key="clarify_mode",
+            help=(
+                "‘Jump straight in’ runs the council immediately. "
+                "‘Let the council ask me first’ has a fast clarifier ask 3-5 questions "
+                "before the deliberation, so the advisors get sharper context."
+            ),
+        )
+
         generate_pdf = st.checkbox("Generate PDF", value=True, key="gen_pdf")
         submitted = st.button(
             "Run council", type="primary", use_container_width=True, key="run_btn"
         )
 
-        # Live-updates whenever `mode` changes, because we're outside a form.
         with st.expander(f"Models in **{mode}** mode", expanded=False):
             cfg = council.MODEL_SETS[mode]
             st.markdown(f"**Chairman:** `{cfg['chairman']}`")
             st.markdown("**Advisors:**")
             for name, model in zip(council.ADVISOR_NAMES, cfg["advisors"]):
                 st.markdown(f"- {name} → `{model}`")
+
+        # Persistence backend indicator (small, non-intrusive)
+        backend = history.backend()
+        if backend == "turso":
+            st.caption("📡 History: Turso (durable across restarts)")
+        else:
+            st.caption(
+                "💾 History: local SQLite "
+                "(ephemeral on Streamlit Cloud — set TURSO_* secrets for durability)"
+            )
 
         if submitted:
             if not question.strip():
@@ -289,16 +539,117 @@ with tab_council:
 
             st.session_state["last_generate_pdf"] = generate_pdf
 
-            start_run(api_key, mode, question)
+            if clarify_choice == "Let the council ask me first":
+                # Kick off Feature A's pre-deliberation clarification flow.
+                st.session_state["clarify_state"] = {
+                    "phase": "generating",
+                    "original_question": question,
+                    "mode": mode,
+                    "api_key": api_key,
+                    "questions": [],
+                    "answers": [],
+                    "current_idx": 0,
+                }
+            else:
+                start_run(api_key, mode, question)
             st.rerun()
 
     # ---- RUNNING ---------------------------------------------------------
     if running:
         elapsed = time.time() - holder["started_at"]
+
+        # Feature B — mid-deliberation interrupts. Surface the FIRST pending
+        # interrupt (FIFO). Other advisors continue running while the user
+        # answers; once submitted, the interrupted advisor's coroutine wakes,
+        # re-runs with the answer injected, and rejoins the gather.
+        pending_order = list(holder.get("interrupts_order", []))
+        if pending_order:
+            key = pending_order[0]
+            interrupt = holder["interrupts_pending"].get(key)
+            if interrupt:
+                advisor_name = interrupt["advisor_name"]
+                stage_label = (
+                    "advisor" if interrupt["stage"] == "advisor" else "peer reviewer"
+                )
+                role = council.PERSONA_ROLES.get(advisor_name)
+                role_subtitle = (
+                    f"{stage_label} · {role}" if role else stage_label
+                )
+
+                st.markdown("### ⏸ The council needs a clarification")
+                st.caption(
+                    f"⏳ {holder['stage']}  ·  {elapsed:0.0f}s elapsed  ·  "
+                    f"other advisors still running"
+                )
+
+                # Trail of any interrupts already answered this run
+                log = holder.get("interrupts_log", [])
+                if log:
+                    with st.expander(
+                        f"Earlier clarifications this run ({len(log)})",
+                        expanded=False,
+                    ):
+                        for i, item in enumerate(log):
+                            _render_answer_card(
+                                i,
+                                f"{item['advisor']} ({item['stage']}): {item['question']}",
+                                item["answer"],
+                            )
+
+                def _submit_interrupt(answer: str):
+                    interrupt["answer"] = answer
+                    interrupt["event"].set()
+                    st.rerun()
+
+                def _skip_interrupt():
+                    interrupt["answer"] = "(user skipped)"
+                    interrupt["event"].set()
+                    st.rerun()
+
+                _render_question_card(
+                    asker=advisor_name,
+                    asker_role=role_subtitle,
+                    question_text=interrupt["question"],
+                    options=interrupt["options"],
+                    allow_freetext=interrupt["allow_freetext"],
+                    key_prefix=f"int_{key}",
+                    on_submit=_submit_interrupt,
+                    on_skip=_skip_interrupt,
+                )
+
+                if st.button(
+                    "⏹ Stop the whole run",
+                    type="secondary",
+                    use_container_width=True,
+                    key="stop_during_interrupt",
+                ):
+                    holder["cancel_event"].set()
+                    interrupt["event"].set()  # unstick the waiter
+                    st.toast("Stopping after the current stage finishes…", icon="⏹")
+                    st.rerun()
+
+                # Refresh more often while waiting on the user — keeps the
+                # "other advisors still running" feel responsive.
+                time.sleep(0.8)
+                st.rerun()
+
+        # No pending interrupts — show the normal running banner.
         st.markdown("### 🏛️ Council in session")
         st.info(f"⏳ {holder['stage']}  ·  {elapsed:0.0f}s elapsed")
+
+        # Show any interrupts already resolved this run (small status line)
+        log = holder.get("interrupts_log", [])
+        if log:
+            st.caption(
+                f"📝 {len(log)} clarification{'s' if len(log) != 1 else ''} "
+                f"answered this run"
+            )
+
         if st.button("⏹ Stop", type="secondary", use_container_width=True):
             holder["cancel_event"].set()
+            # Unblock any (just-arrived) interrupt waiters too
+            for k, it in list(holder.get("interrupts_pending", {}).items()):
+                it["event"].set()
             st.toast("Stopping after the current stage finishes…", icon="⏹")
             st.rerun()
         st.caption(
@@ -374,6 +725,33 @@ with tab_council:
                 st.session_state["_clear_question"] = True
                 st.rerun()
 
+        clarifications = result.get("clarifications", [])
+        interrupts = result.get("interrupts", [])
+        if clarifications or interrupts:
+            with st.expander(
+                f"Question & Context "
+                f"({len(clarifications)} pre-deliberation, "
+                f"{len(interrupts)} mid-deliberation)",
+                expanded=False,
+            ):
+                if clarifications:
+                    st.markdown("**Pre-deliberation clarifications**")
+                    for i, c in enumerate(clarifications, 1):
+                        st.markdown(f"**Q{i}.** {c['question']}")
+                        st.markdown(f"_{c['answer']}_")
+                if interrupts:
+                    if clarifications:
+                        st.markdown("---")
+                    st.markdown("**Mid-deliberation clarifications**")
+                    for i, it in enumerate(interrupts, 1):
+                        stage_lbl = (
+                            "advisor" if it.get("stage") == "advisor"
+                            else "peer reviewer"
+                        )
+                        st.caption(f"{it['advisor']} · {stage_lbl}")
+                        st.markdown(f"**Q{i}.** {it['question']}")
+                        st.markdown(f"_{it['answer']}_")
+
         st.markdown("## 🏛️ Chairman's Verdict")
         st.markdown(chairman_verdict)
 
@@ -426,6 +804,26 @@ with tab_history:
                 st.markdown(row["chairman_verdict"])
                 st.caption("— original question —")
                 st.markdown(f"> {row['question']}")
+
+                row_clar = row.get("clarifications", []) or []
+                row_int = row.get("interrupts", []) or []
+                if row_clar:
+                    st.caption("— pre-deliberation clarifications —")
+                    for i, c in enumerate(row_clar, 1):
+                        st.markdown(f"**Q{i}.** {c['question']}")
+                        st.markdown(f"_{c['answer']}_")
+                if row_int:
+                    st.caption("— mid-deliberation clarifications —")
+                    for i, it in enumerate(row_int, 1):
+                        stage_lbl = (
+                            "advisor" if it.get("stage") == "advisor"
+                            else "peer reviewer"
+                        )
+                        st.markdown(
+                            f"**{it['advisor']}** ({stage_lbl}) — "
+                            f"_{it['question']}_"
+                        )
+                        st.markdown(f"→ {it['answer']}")
 
             c1, c2, _ = st.columns([1, 1, 2])
             with c1:
