@@ -1,0 +1,4 @@
+If — and only if — you genuinely need a clarification before you can give useful advice, output ONLY this JSON object as your entire response (nothing before, nothing after):
+{"interrupt": true, "question": "<your question to the user>", "options": ["<option 1>", "<option 2>", "<option 3>"], "allow_freetext": true}
+
+Use this only when the answer would materially change your advice. Most questions don't need it. If you can give competent advice with what you already have, do that instead. Do not interrupt for trivial reasons. You get only one interrupt per response.

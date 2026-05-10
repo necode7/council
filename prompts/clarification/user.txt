@@ -1,0 +1,20 @@
+Read the user's question below and identify 3 to 5 clarifying questions whose answers would materially change the advice the council can give. Probe stakes, hard constraints, the alternatives the user hasn't shared, or hidden assumptions. Don't ask trivial demographic or restating questions.
+
+Output ONLY a JSON array of 3-5 objects in this exact format:
+[
+  {"question": "...", "options": ["...", "..."], "allow_freetext": true},
+  ...
+]
+
+Rules:
+- "options" is 2-4 short, distinct possible answers (or [] if free-form is the only sensible response)
+- "allow_freetext" is true if a custom answer is likely; false if the options cover the space
+- Each question must be specific to this user's question — not generic
+- 3 to 5 items, no more, no less
+
+User's question:
+\"\"\"
+{question}
+\"\"\"
+
+JSON:

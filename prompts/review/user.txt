@@ -1,0 +1,13 @@
+The original question was:
+
+{question}
+
+Five advisors gave the responses below (anonymized as A-E). Read all five, then answer:
+
+1. Which response is strongest, and why?
+2. Which response has the biggest blind spot, and what is it?
+3. What did all five of them miss?
+
+Be concise. Aim for 3 short paragraphs total — one per question.
+
+{anon_block}

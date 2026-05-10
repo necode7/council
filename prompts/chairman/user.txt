@@ -1,0 +1,28 @@
+ORIGINAL QUESTION:
+{question}
+
+============================================================
+ADVISOR RESPONSES:
+{advisor_block}
+
+============================================================
+PEER REVIEWS:
+{review_block}
+
+============================================================
+Now write the final synthesis. Use EXACTLY these section headers and order, in markdown:
+
+## Where the Council Agrees
+[High-confidence points multiple advisors converged on]
+
+## Where the Council Clashes
+[Genuine disagreements. Present both sides. Explain why reasonable advisors disagree.]
+
+## Blind Spots the Council Caught
+[Things that only emerged through peer review]
+
+## The Recommendation
+[A clear, direct recommendation. Not "it depends." A real answer with reasoning.]
+
+## The One Thing to Do First
+[A single concrete next step. Not a list. One thing.]

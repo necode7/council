@@ -333,6 +333,8 @@ def _render_answer_card(idx: int, q_text: str, answer: str):
 # =============================================================================
 
 st.title("🏛️ LLM Council")
+st.markdown("`Metamorphosis • Phase 3 Architecture Active`")
+st.divider()
 st.caption(
     "Five advisors debate your decision on different models. "
     "They peer-review each other anonymously. A chairman delivers the verdict."
@@ -878,3 +880,6 @@ with tab_history:
                 st.session_state.pop("clear_all_confirm", None)
                 st.toast("History cleared.", icon="🗑️")
                 st.rerun()
+
+st.markdown("---")
+st.caption("LLM Council Refactor: Phases 1–3 Complete")

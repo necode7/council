@@ -20,6 +20,8 @@ import httpx
 import markdown2
 
 import history
+import agents
+from providers import openrouter
 
 
 # Raised when the user clicks Stop / cancels mid-run. Defined here (not in
@@ -27,6 +29,21 @@ import history
 # propagate cancellation cleanly.
 class Cancelled(Exception):
     pass
+
+# =============================================================================
+# PROMPT LOADER
+# =============================================================================
+
+
+def load_prompt(rel_path: str) -> str:
+    """Load a prompt template from the prompts/ directory."""
+    path = Path(__file__).parent / "prompts" / rel_path
+    if not path.exists():
+        # Minimal fallback to avoid total failure if a file is missing
+        return f"[ERROR: Prompt file {rel_path} not found]"
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
 
 # =============================================================================
 # USER EDITS ONLY THESE THREE
@@ -84,58 +101,42 @@ MODEL_SETS = {
     },
 }
 
-PERSONAS = {
-    "Contrarian": (
-        "You are the Contrarian advisor. Actively look for what's wrong, missing, "
-        "or will fail. Assume the idea has a fatal flaw and find it. Stress-test "
-        "by asking the questions the user is avoiding. Be direct. Don't soften."
-    ),
-    "First Principles Thinker": (
-        "You are the First Principles Thinker. Ignore the surface question. Ask "
-        "what they're actually trying to solve. Strip assumptions. Rebuild the "
-        "problem from the ground up. If they're asking the wrong question, say so."
-    ),
-    "Expansionist": (
-        "You are the Expansionist advisor. Hunt for upside everyone else is missing. "
-        "What could be bigger? What adjacent opportunity is hiding? Care about what "
-        "happens if this works better than expected."
-    ),
-    "Outsider": (
-        "You are the Outsider advisor. You have zero context about this person, "
-        "their field, or history. Respond purely to what's in front of you. Catch "
-        "the curse of knowledge — things obvious to insiders but invisible to outsiders."
-    ),
-    "Executor": (
-        "You are the Executor advisor. Only one thing matters: can this be done, "
-        "and what's the fastest path? Ignore theory and big-picture thinking. Look "
-        "at every idea through 'OK, but what do you do Monday morning?'"
-    ),
-}
+# =============================================================================
+# AGENT DEFINITIONS
+# =============================================================================
 
-ADVISOR_NAMES = list(PERSONAS.keys())
+ADVISOR_NAMES, PERSONAS, PERSONA_ROLES = agents.get_persona_mappings(load_prompt)
 
-# Short role labels for UI subtitles (interrupt cards).
-PERSONA_ROLES = {
-    "Contrarian": "stress-tests for failure modes",
-    "First Principles Thinker": "rebuilds the problem from scratch",
-    "Expansionist": "hunts for hidden upside",
-    "Outsider": "catches the curse of knowledge",
-    "Executor": "asks 'what do you do Monday morning?'",
-}
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 TIMEOUT = 120.0
+
+# =============================================================================
+# PROVIDER WRAPPER
+# =============================================================================
+
+
+async def call_provider(
+    client: httpx.AsyncClient,
+    api_key: str,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int,
+    label: str,
+) -> str:
+    """Wrapper to call the underlying provider. Currently hardcoded to OpenRouter."""
+    return await openrouter.call_openrouter(
+        client, api_key, model, system, user,
+        temperature, max_tokens, label, timeout=TIMEOUT
+    )
+
 
 # =============================================================================
 # INTERRUPT PROTOCOL (Feature B)
 # =============================================================================
 
-INTERRUPT_INSTRUCTION = """
-
-If — and only if — you genuinely need a clarification before you can give useful advice, output ONLY this JSON object as your entire response (nothing before, nothing after):
-{"interrupt": true, "question": "<your question to the user>", "options": ["<option 1>", "<option 2>", "<option 3>"], "allow_freetext": true}
-
-Use this only when the answer would materially change your advice. Most questions don't need it. If you can give competent advice with what you already have, do that instead. Do not interrupt for trivial reasons. You get only one interrupt per response."""
+INTERRUPT_INSTRUCTION = load_prompt("advisors/common/interrupt_instruction.txt")
 
 
 def parse_interrupt(response: str) -> dict | None:
@@ -199,32 +200,8 @@ def parse_interrupt(response: str) -> dict | None:
 # CLARIFICATION GENERATOR (Feature A)
 # =============================================================================
 
-CLARIFICATION_SYSTEM = (
-    "You generate clarifying questions to ask before a 5-person advisory "
-    "council deliberates on a user's decision. You output strict JSON only — "
-    "no preamble, no explanation, no code fences."
-)
-
-CLARIFICATION_USER_TMPL = """Read the user's question below and identify 3 to 5 clarifying questions whose answers would materially change the advice the council can give. Probe stakes, hard constraints, the alternatives the user hasn't shared, or hidden assumptions. Don't ask trivial demographic or restating questions.
-
-Output ONLY a JSON array of 3-5 objects in this exact format:
-[
-  {{"question": "...", "options": ["...", "..."], "allow_freetext": true}},
-  ...
-]
-
-Rules:
-- "options" is 2-4 short, distinct possible answers (or [] if free-form is the only sensible response)
-- "allow_freetext" is true if a custom answer is likely; false if the options cover the space
-- Each question must be specific to this user's question — not generic
-- 3 to 5 items, no more, no less
-
-User's question:
-\"\"\"
-{question}
-\"\"\"
-
-JSON:"""
+CLARIFICATION_SYSTEM = load_prompt("clarification/system.txt")
+CLARIFICATION_USER_TMPL = load_prompt("clarification/user.txt")
 
 
 def _parse_clarification_questions(raw: str) -> list[dict]:
@@ -292,7 +269,7 @@ async def _generate_clarification_questions_async(
     api_key: str, question: str
 ) -> list[dict]:
     async with httpx.AsyncClient() as client:
-        raw = await call_openrouter(
+        raw = await call_provider(
             client, api_key,
             model="anthropic/claude-haiku-4.5",
             system=CLARIFICATION_SYSTEM,
@@ -314,85 +291,14 @@ def inject_clarifications(question: str, qa_pairs: list[tuple[str, str]]) -> str
     question stays first; clarification Q&A appears as labelled context."""
     if not qa_pairs:
         return question
-    lines = ["", "--- USER CLARIFICATIONS (asked before deliberation) ---"]
+    header = load_prompt("clarification/inject_header.txt")
+    footer = load_prompt("clarification/inject_footer.txt")
+    lines = ["", header]
     for i, (q, a) in enumerate(qa_pairs, 1):
         lines.append(f"Q{i}: {q}")
         lines.append(f"A{i}: {a}")
-    lines.append("--- END CLARIFICATIONS ---")
+    lines.append(footer)
     return question + "\n".join(["\n"] + lines)
-
-# =============================================================================
-# OPENROUTER CALL
-# =============================================================================
-
-
-async def call_openrouter(
-    client: httpx.AsyncClient,
-    api_key: str,
-    model: str,
-    system: str,
-    user: str,
-    temperature: float,
-    max_tokens: int,
-    label: str,
-    max_retries: int = 2,
-) -> str:
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/llm-council",
-        "X-Title": "LLM Council",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-
-    last_error = f"[ERROR from {label} ({model}) — exhausted retries]"
-    for attempt in range(max_retries + 1):
-        try:
-            resp = await client.post(
-                OPENROUTER_URL, headers=headers, json=payload, timeout=TIMEOUT
-            )
-            if resp.status_code != 200:
-                last_error = f"[ERROR from {label} ({model}) — HTTP {resp.status_code}: {resp.text[:300]}]"
-                if resp.status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < max_retries:
-                    await asyncio.sleep(1.5 ** attempt)
-                    continue
-                return last_error
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                last_error = f"[ERROR from {label} ({model}) — empty choices: {str(data)[:300]}]"
-                if attempt < max_retries:
-                    await asyncio.sleep(0.5)
-                    continue
-                return last_error
-            content = choices[0].get("message", {}).get("content", "")
-            if not content or not content.strip():
-                last_error = f"[ERROR from {label} ({model}) — empty content]"
-                if attempt < max_retries:
-                    # Bump max_tokens on retry — empty content often means
-                    # reasoning models burned all tokens internally.
-                    payload["max_tokens"] = int(max_tokens * 1.5)
-                    await asyncio.sleep(0.5)
-                    continue
-                return last_error
-            return content.strip()
-        except httpx.TimeoutException:
-            last_error = f"[ERROR from {label} ({model}) — timed out after {TIMEOUT}s]"
-            if attempt < max_retries:
-                continue
-            return last_error
-        except Exception as e:
-            last_error = f"[ERROR from {label} ({model}) — {type(e).__name__}: {e}]"
-            return last_error
-    return last_error
 
 
 # =============================================================================
@@ -406,38 +312,10 @@ async def topic_from_question(
     question: str,
 ) -> str:
     """Cheap Haiku call → short underscore-joined label naming the decision."""
-    system = "You produce short topic labels for a decision-making app. Output only the label, nothing else."
-    user = f"""Read the question and output a short topic label (2-4 words) that names the decision being asked about.
-
-Format rules:
-- 2 to 4 words connected with underscores
-- ASCII letters and digits only
-- Title Case for normal words (Battery, Calculation, Strategy)
-- ALL CAPS for acronyms and short technical abbreviations (ML, AI, CA, US, API, RL, BMS, LLM)
-- lowercase for English connectors only: "of", "vs", "and", "the", "or"
-- No quotes, no explanation, just the label
-
-Examples:
-Q: "Council this: should I take the Microsoft offer or stay at my startup?"
-A: Microsoft_Offer_vs_Startup
-
-Q: "Can ML help fix battery degradation calculation in real-time?"
-A: ML_Battery_Degradation_Calculation
-
-Q: "Should I focus on CA finals or my RL project?"
-A: CA_Finals_vs_RL_Project
-
-Q: "Should I marry Priya or wait another year?"
-A: Marry_Priya_vs_Wait
-
-Q: "Should I quit my job and start a startup?"
-A: Quit_Job_for_Startup
-
-Question:
-{question[:2000]}
-
-Label:"""
-    raw = await call_openrouter(
+    system = load_prompt("slugger/system.txt")
+    user_tmpl = load_prompt("slugger/user.txt")
+    user = user_tmpl.format(question=question[:2000])
+    raw = await call_provider(
         client, api_key,
         model="anthropic/claude-haiku-4.5",
         system=system,
@@ -479,7 +357,7 @@ async def _call_with_interrupt(
     user's answer, then re-run with the answer injected (max 1 interrupt
     per call). Other coroutines continue running while we await the user."""
     sys_for_call = system + (INTERRUPT_INSTRUCTION if holder is not None else "")
-    response = await call_openrouter(
+    response = await call_provider(
         client, api_key, model, sys_for_call, user,
         temperature=temperature, max_tokens=max_tokens, label=label,
     )
@@ -528,14 +406,12 @@ async def _call_with_interrupt(
         holder["interrupts_order"].remove(key)
 
     # One-shot: do NOT pass INTERRUPT_INSTRUCTION on the resume call.
+    resume_tmpl = load_prompt("advisors/common/resume_user.txt")
     augmented_user = (
         user.rstrip()
-        + "\n\n--- YOUR EARLIER CLARIFICATION ---\n"
-        + f"You asked: {interrupt['question']}\n"
-        + f"User answered: {answer_text}\n"
-        + "Now provide your full advice."
+        + resume_tmpl.format(question=interrupt['question'], answer=answer_text)
     )
-    return await call_openrouter(
+    return await call_provider(
         client, api_key, model, system, augmented_user,
         temperature=temperature, max_tokens=max_tokens,
         label=f"{label} (post-interrupt)",
@@ -551,13 +427,11 @@ async def run_advisors(
 ) -> dict:
     """advisor_models: {advisor_name: model_id}.  Returns {advisor_name: response}.
     If `holder` is provided, advisors may interrupt with a clarifying question."""
+    suffix = load_prompt("advisors/common/advisor_suffix.txt")
     tasks = []
     for name in ADVISOR_NAMES:
         model = advisor_models[name]
-        system = PERSONAS[name] + (
-            "\n\nGive a focused response of 2-4 short paragraphs. No filler, no "
-            "throat-clearing. Speak directly to the user about their decision."
-        )
+        system = PERSONAS[name] + suffix
         tasks.append(
             _call_with_interrupt(
                 client, api_key,
@@ -600,28 +474,15 @@ async def run_peer_review(
     letter_to_response, letter_to_name = anonymize(advisor_responses)
     anon_block = build_anonymized_block(letter_to_response)
 
-    review_prompt = f"""The original question was:
+    review_user_tmpl = load_prompt("review/user.txt")
+    review_prompt = review_user_tmpl.format(question=question, anon_block=anon_block)
 
-{question}
-
-Five advisors gave the responses below (anonymized as A-E). Read all five, then answer:
-
-1. Which response is strongest, and why?
-2. Which response has the biggest blind spot, and what is it?
-3. What did all five of them miss?
-
-Be concise. Aim for 3 short paragraphs total — one per question.
-
-{anon_block}"""
+    review_system = load_prompt("review/system.txt")
 
     tasks = []
     for name in ADVISOR_NAMES:
         model = advisor_models[name]
-        system = (
-            "You are a member of an advisory council, peer-reviewing the work of "
-            "four colleagues plus your own (you don't know which is which). Be "
-            "honest, specific, and brief. Reference responses by their letter (A-E)."
-        )
+        system = review_system
         tasks.append(
             _call_with_interrupt(
                 client, api_key,
@@ -653,44 +514,15 @@ async def run_chairman(
         for name in ADVISOR_NAMES
     )
 
-    system = (
-        "You are the Chairman of an advisory council. Five advisors have given "
-        "their views, and each has peer-reviewed the others anonymously. Your job "
-        "is to synthesize a clear, decisive verdict for the user. Do not hedge. "
-        "Do not say 'it depends'. Give a real recommendation."
+    system = load_prompt("chairman/system.txt")
+    user_tmpl = load_prompt("chairman/user.txt")
+    user = user_tmpl.format(
+        question=question,
+        advisor_block=advisor_block,
+        review_block=review_block
     )
 
-    user = f"""ORIGINAL QUESTION:
-{question}
-
-============================================================
-ADVISOR RESPONSES:
-{advisor_block}
-
-============================================================
-PEER REVIEWS:
-{review_block}
-
-============================================================
-Now write the final synthesis. Use EXACTLY these section headers and order, in markdown:
-
-## Where the Council Agrees
-[High-confidence points multiple advisors converged on]
-
-## Where the Council Clashes
-[Genuine disagreements. Present both sides. Explain why reasonable advisors disagree.]
-
-## Blind Spots the Council Caught
-[Things that only emerged through peer review]
-
-## The Recommendation
-[A clear, direct recommendation. Not "it depends." A real answer with reasoning.]
-
-## The One Thing to Do First
-[A single concrete next step. Not a list. One thing.]
-"""
-
-    return await call_openrouter(
+    return await call_provider(
         client, api_key, chairman_model, system, user,
         temperature=0.5, max_tokens=2500, label="Chairman",
     )

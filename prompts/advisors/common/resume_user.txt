@@ -1,0 +1,6 @@
+
+
+--- YOUR EARLIER CLARIFICATION ---
+You asked: {question}
+User answered: {answer}
+Now provide your full advice.

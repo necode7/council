@@ -1,0 +1,30 @@
+Read the question and output a short topic label (2-4 words) that names the decision being asked about.
+
+Format rules:
+- 2 to 4 words connected with underscores
+- ASCII letters and digits only
+- Title Case for normal words (Battery, Calculation, Strategy)
+- ALL CAPS for acronyms and short technical abbreviations (ML, AI, CA, US, API, RL, BMS, LLM)
+- lowercase for English connectors only: "of", "vs", "and", "the", "or"
+- No quotes, no explanation, just the label
+
+Examples:
+Q: "Council this: should I take the Microsoft offer or stay at my startup?"
+A: Microsoft_Offer_vs_Startup
+
+Q: "Can ML help fix battery degradation calculation in real-time?"
+A: ML_Battery_Degradation_Calculation
+
+Q: "Should I focus on CA finals or my RL project?"
+A: CA_Finals_vs_RL_Project
+
+Q: "Should I marry Priya or wait another year?"
+A: Marry_Priya_vs_Wait
+
+Q: "Should I quit my job and start a startup?"
+A: Quit_Job_for_Startup
+
+Question:
+{question}
+
+Label:
